@@ -78,17 +78,7 @@ systemctl --user restart app
 | Remote transport | **system OpenSSH** in a PTY + **ControlMaster**; **tmux control mode** (`-CC`) for implied sessions | Respects ~/.ssh/config, agents, ProxyJump |
 | Screen state | **pyte** | Kernel-side "what's on screen" for prompt heuristics & screenshots |
 
-npm's involvement: **build-time only.** And yes, we vendor xterm.js even though JupyterLab
-ships a copy: Lab's xterm.js is an internal dependency of its terminal extension, not an API
-surface an anywidget module can import from, and it doesn't exist at all in VS Code or Colab —
-bundling our own (~300 KB) is the only portable option, and it decouples us from Lab's version.
-xterm.js and its addons are npm packages; during
-development we bundle them with esbuild into a single static ESM file that ships inside the
-wheel (anywidget loads it directly). End users only ever `pip install quahog` — no node, no
-npm, no `jupyter labextension` step. We can vendor the prebuilt bundle in the repo so even CI
-doesn't need node. Since pop-out no longer needs a companion extension (§4) and cell creation
-is kernel-side (§5), there is currently **no labextension at all**, so npm never touches the
-install path.
+(p)npm is used to assemble the front-end JS and CSS, which are then packaged into the python as source.
 
 ---
 

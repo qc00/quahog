@@ -1,0 +1,18 @@
+{
+  "name": "quahog-widget",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild widget.js --bundle --minify --format=esm --outfile=../src/quahog/static/index.js && cat node_modules/@xterm/xterm/css/xterm.css widget.css > ../src/quahog/static/widget.css"
+  },
+  "dependencies": {
+    "@xterm/xterm": "^5.5.0",
+    "@xterm/addon-fit": "^0.10.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
