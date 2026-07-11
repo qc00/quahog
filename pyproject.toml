@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "quahog"
-version = "0.1.0"
+version = "0.4.0"
 description = "Interactive console sessions, captured in Jupyter notebooks"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,6 +13,7 @@ dependencies = [
     "anywidget>=0.9",
     "ptyprocess>=0.7; sys_platform != 'win32'",
     "ipython>=8.0",
+    "pyte>=0.8",
 ]
 classifiers = [
     "Framework :: Jupyter",
@@ -20,7 +21,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "jupyterlab>=4"]
+dev = ["pytest>=7", "pytest-timeout>=2", "jupyterlab>=4"]
 
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
@@ -31,3 +32,4 @@ artifacts = ["src/quahog/static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 60

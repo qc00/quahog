@@ -66,9 +66,39 @@ wins). One dump per cell. Toggle capture with `h.minuting`.
 Displaying `h` again in another cell *hops* the live console there; the old
 view freezes into a static snapshot.
 
-Design document: [PLAN.md](PLAN.md). Milestones 1–2 are done (local bash/zsh,
-unix only; run/fork/magics/minuting/hop). Recording, ssh, and Windows support
-are later milestones.
+Recording and hygiene:
+
+```python
+h = q.bash(record=True)      # or h.record(True) any time; sidecar next to the
+                              # notebook: deploy.ipynb -> deploy.quahog/*.cast
+h.record(False)              # pause; h.record(True) resumes
+h.erase(2)                   # redact the last 2 keystrokes from the recording
+                              # (works within the delayed-flush tail, echoed or not)
+h.screenshot()                # current screen -> anchor cell, as text
+h.cast_path, h.recording      # where it's writing, whether it's live
+```
+
+The one hard invariant: interactively typed passwords never reach disk.
+Input is auto-replaced with `[input suppressed]` when the local terminal is in
+canonical no-echo mode (`read -s`, `passwd`, `sudo` with `pwfeedback`) or a
+password interceptor has pre-armed suppression for a matched remote prompt
+(`sudo`/`su`/`ssh`/`passwd`). Feed secrets from a keyring without ever
+recording them: `h.send(secret, record=False)` or `h.stdin.raw.write(...)`.
+Widget toolbar: ⏸ pause/resume, ⌫ erase (flashes on an un-echoed or masked
+keystroke), camera for a screenshot.
+
+Interceptors (`quahog.interceptors`) match a command and act around it —
+`vim`/`nano` diff the file before/after into the cell; `less`/`man` are a
+no-op (use the screenshot button); `sudo`/`su`/`ssh`/`passwd` arm password
+suppression. Register your own: `quahog.interceptors.register(my_interceptor)`,
+or ship one via the `quahog.interceptors` entry-point group.
+
+While a full-screen app owns the alt-screen (`vim`, `less`, `htop`), `run()`
+refuses and minuting pauses — interact through the embedded console instead.
+
+Design document: [PLAN.md](PLAN.md). Milestones 1–3 are done (local bash/zsh,
+unix only; run/fork/magics/minuting/hop/recording/interceptors). ssh and
+Windows support are later milestones.
 
 ## Development
 

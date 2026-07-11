@@ -52,6 +52,9 @@ class CommandResult:
         self.started_at = time.time()
         self.finished_at: Optional[float] = None
         self.returncode: Optional[int] = None
+        # Extra text blocks attached by interceptors (e.g. a vim diff); they
+        # render after the output in the cell (PLAN.md §6).
+        self.notes: List[str] = []
         self._buf = bytearray()
         self._capturing = False
         self._done = threading.Event()
@@ -108,6 +111,7 @@ class CommandResult:
             parts.append("… running")
         elif self.returncode not in (0, None):
             parts.append(f"[exit {self.returncode}]")
+        parts.extend(self.notes)
         return "\n".join(parts)
 
     def _repr_mimebundle_(self, include=None, exclude=None):
@@ -118,6 +122,7 @@ class CommandResult:
                 "command": self.command,
                 "raw": self.raw,
                 "returncode": self.returncode,
+                "notes": list(self.notes),
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
             },

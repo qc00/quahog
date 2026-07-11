@@ -18,12 +18,19 @@ import tempfile
 import threading
 from collections import deque
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Union
+from typing import Dict, List, NamedTuple, Optional, Union
 
+from . import interceptors as _interceptors
 from .fork import ForkHandle
-from .minutes import Transcript
+from .minutes import Note, Transcript
 from .osc import StreamParser
+from .record import Recorder
 from .result import CommandResult, clean_text
+
+try:
+    from .screen import ScreenMirror
+except Exception:  # pyte missing: sessions still work, screenshots don't
+    ScreenMirror = None
 
 
 class _LastDump:
@@ -87,8 +94,10 @@ class _Ring:
 class _Stdin:
     """sys.stdin-shaped input: text at the top, bytes via .buffer.
 
-    The record= plumbing (PLAN.md §3) lands with the recording milestone; the
-    parameter is accepted now so calling code doesn't change later.
+    ``record=False`` (or the ``.raw`` variant) sends the bytes to the PTY but
+    leaves only an ``[input suppressed]`` placeholder in the .cast — the
+    sanctioned path for feeding secrets from a keyring/vault into an
+    interactive prompt without them ever touching disk (PLAN.md §3).
     """
 
     class _Buffer:
@@ -96,7 +105,21 @@ class _Stdin:
             self._s = session
 
         def write(self, data: bytes, record: bool = True) -> int:
-            self._s._write(data)
+            self._s._input(data, record=record)
+            return len(data)
+
+        def flush(self) -> None:
+            pass
+
+    class _Raw:
+        """Unrecorded byte layer: h.stdin.raw.write(b"...")."""
+
+        def __init__(self, session: "Session") -> None:
+            self._s = session
+
+        def write(self, data) -> int:
+            data = data if isinstance(data, bytes) else str(data).encode()
+            self._s._input(data, record=False)
             return len(data)
 
         def flush(self) -> None:
@@ -105,9 +128,10 @@ class _Stdin:
     def __init__(self, session: "Session") -> None:
         self._s = session
         self.buffer = _Stdin._Buffer(session)
+        self.raw = _Stdin._Raw(session)
 
     def write(self, data: str, record: bool = True) -> int:
-        self._s._write(data.encode())
+        self._s._input(data.encode(), record=record)
         return len(data)
 
     def flush(self) -> None:
@@ -124,7 +148,7 @@ class Session:
         shell_kind: str = "bash",
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
-        record: bool = False,  # accepted per plan; recording lands in M3
+        record: bool = False,
         rows: int = 24,
         cols: int = 100,
     ) -> None:
@@ -152,6 +176,22 @@ class Session:
         self._widget = None
         self._kernel = self._find_kernel()
         self.stdin = _Stdin(self)
+
+        # Recording & hygiene (PLAN.md §6). The recorder exists even when not
+        # recording so the toolbar and interceptors always have a target; the
+        # mirror keeps kernel-side screen state for screenshots and tracks the
+        # alt-screen switch that marks full-screen apps.
+        self._recorder = Recorder(name, on_event=self._on_rec_event)
+        self._mirror = None
+        if ScreenMirror is not None:
+            try:
+                self._mirror = ScreenMirror(rows, cols)
+            except Exception:
+                pass  # pyte missing or misbehaving: sessions still work
+        self.altscreen = False
+        self._iactive: List[tuple] = []  # (interceptor, ctx) for the running command
+        if record:
+            self._recorder.start(rows, cols)
 
         # Minuting (PLAN.md §5): interactive commands are captured between the
         # shell integration's C and D markers; the typed text arrives on the
@@ -203,10 +243,18 @@ class Session:
                 data = b""
             if not data:
                 break
+            alt = None
             with self._lock:
                 self._ring.append(data)
+                if self._mirror is not None:
+                    alt = self._mirror.feed(data)
+                    if alt is not None:
+                        self.altscreen = alt
                 for tok in self._parser.feed(data):
                     self._on_token(tok)
+            self._recorder.output(data)
+            if alt is not None:
+                self._emit({"type": "altscreen", "on": alt}, [])
             self._emit({"type": "out"}, [data])
         self._on_exit()
 
@@ -234,6 +282,7 @@ class Session:
         if not icap.command:
             icap.command = self._typed_cmd or ""
         self._typed_cmd = None
+        self._ifinish(icap)
         icap._finish(rc)
         raw_s = slice(marks[0], self._raw_len) if marks else slice(0, 0)
         text_s = slice(marks[1], self._text_boundary()) if marks else slice(0, 0)
@@ -245,6 +294,15 @@ class Session:
             target = self._active if self._active is not None else self._icap
             if target is not None and target._capturing:
                 target._buf += tok[1]
+            if self._iactive:
+                text = tok[1].decode("utf-8", "replace")
+                for itc, ctx in self._iactive:
+                    fn = getattr(itc, "on_output", None)
+                    if fn is not None:
+                        try:
+                            fn(ctx, text)
+                        except Exception:
+                            pass
             return
         _, num, payload = tok
         if num == "133":
@@ -252,14 +310,21 @@ class Session:
             if code == "C":
                 if self._active is not None:
                     self._active._capturing = True
+                    self._istart(self._active)
                 else:
                     # Interactively typed command: capture it the same way.
-                    # zsh's preexec delivered the text on 5522;E already; bash
-                    # delivers it in precmd, just before D.
+                    # Both shells deliver the text on 5522;E just before C
+                    # (zsh from preexec; bash from the DEBUG trap); bash sends
+                    # a history-accurate correction in precmd, before D.
                     self._icap = CommandResult(self.name, self._typed_cmd or "")
                     self._icap._capturing = True
+                    if self._recorder.suppressed:
+                        # Typed while input suppression is active (PLAN.md §5):
+                        # likely a secret misread as a command — never minuted.
+                        self._icap._qs_suppressed = True
                     self._icap_marks = (self._raw_len, self._text_boundary())
                     self._typed_cmd = None
+                    self._istart(self._icap)
             elif code == "D":
                 parts = payload.split(";")
                 rc = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
@@ -268,6 +333,7 @@ class Session:
                     # The E marker fired for this run() command too; drop the
                     # stash or the next *interactive* command inherits it.
                     self._typed_cmd = None
+                    self._ifinish(active)
                     active._finish(rc)
                 elif self._icap is not None:
                     self._close_icap(rc)
@@ -281,10 +347,14 @@ class Session:
         elif num == "5522":
             kind, _, rest = payload.partition(";")
             if kind == "E":
-                if self._icap is not None and not self._icap.command:
-                    self._icap.command = rest.strip()
+                cmd = rest.strip()
+                if self._icap is not None:
+                    # bash's precmd E carries the history-accurate line; it
+                    # supersedes the DEBUG-trap guess the capture opened with.
+                    if cmd:
+                        self._icap.command = cmd
                 else:
-                    self._typed_cmd = rest.strip()
+                    self._typed_cmd = cmd
         elif num == "7" and payload.startswith("file://"):
             rest = payload[len("file://") :]
             slash = rest.find("/")
@@ -297,6 +367,8 @@ class Session:
             return
         if "__qua_" in command or str(_INJECT_DIR) in command:
             return  # quahog's own plumbing (reinject, fork helper) isn't minuted
+        if getattr(result, "_qs_suppressed", False):
+            return  # typed while input suppression was active: never minuted
         transcript = self._transcript
         if transcript is not None:
             transcript.append(result)
@@ -311,6 +383,47 @@ class Session:
                     returncode=result.returncode,
                 )
             )
+
+    # ----------------------------------------------------------- interceptors
+    def _istart(self, result: CommandResult) -> None:
+        """Match interceptors (PLAN.md §6) against the command that just
+        started; run their before() hooks. Called at the OSC 133;C marker."""
+        self._iactive = []
+        command = (result.command or "").strip()
+        if not command or "__qua_" in command:
+            return
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+        if not argv:
+            return
+        for itc in _interceptors.all_interceptors():
+            try:
+                if not itc.match(argv, self):
+                    continue
+                ctx = _interceptors.Ctx(self, argv, command)
+                fn = getattr(itc, "before", None)
+                if fn is not None:
+                    fn(ctx)
+                self._iactive.append((itc, ctx))
+            except Exception:
+                pass
+
+    def _ifinish(self, result: Optional[CommandResult]) -> None:
+        """Command ended (OSC 133;D or forced close): run after() hooks,
+        attach any returned text to the result, drop leaked suppressions."""
+        active, self._iactive = self._iactive, []
+        for itc, ctx in active:
+            out = None
+            try:
+                fn = getattr(itc, "after", None)
+                out = fn(ctx) if fn is not None else None
+            except Exception:
+                out = None
+            ctx._release_all()
+            if out and result is not None:
+                result.notes.append(str(out))
 
     # ------------------------------------------------------ lifetime streams
     @property
@@ -427,10 +540,13 @@ class Session:
             active, self._active = self._active, None
             if self._icap is not None:
                 self._close_icap(self._returncode)
+            elif active is not None:
+                self._ifinish(active)
         if active is not None:
             active._finish(self._returncode)
         self._exited.set()
         self._at_prompt.set()  # unblock anyone waiting on a dead shell
+        self._recorder.close()
         self._emit({"type": "exited", "code": self._returncode}, [])
 
     # ------------------------------------------------------------- commands
@@ -449,6 +565,11 @@ class Session:
             raise ValueError("multi-line commands are not supported yet; use %%qua or join with '&&'")
         if self._exited.is_set():
             raise RuntimeError(f"session {self.name!r} has exited")
+        if self.altscreen:
+            raise RuntimeError(
+                f"session {self.name!r} is inside a full-screen app (alt-screen); "
+                "run() is disabled — interact via the console or screenshot()"
+            )
         with self._lock:
             if self._active is not None:
                 raise RuntimeError(f"session {self.name!r} is busy running: {self._active.command!r}")
@@ -460,23 +581,34 @@ class Session:
             self._active = result
             self._typed_cmd = None
             self._at_prompt.clear()
-        self._write(command.encode() + b"\r")
+        self._input(command.encode() + b"\r")
         if wait:
             if not result._done.wait(timeout):
                 raise TimeoutExpired(result, timeout)
         return result
 
-    def fork(self, command: str, timeout: float = 15.0) -> ForkHandle:
+    def fork(self, command: str, timeout: float = 15.0, record: Optional[bool] = None) -> ForkHandle:
         """Run ``command`` with fresh std streams and its own handle.
 
         The kernel creates a FIFO trio; the injected __qua_fork helper starts
         ``sh -c command`` redirected onto it in the background, so the session
         stays free and stdout/stderr are genuinely separate.
+
+        ``record`` defaults to the parent session's recording state; a
+        recording fork gets its own .cast file in the sidecar folder.
         """
+        cast = None
+        if record is None:
+            record = self._recorder.recording
+        if record:
+            from .record import CastWriter, sidecar_dir
+
+            ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            cast = CastWriter(sidecar_dir() / f"{self.name}-fork-{ts}.cast", self._cols, self._rows)
         forkdir = tempfile.mkdtemp(prefix="quaf-")
         for n in ("0", "1", "2"):
             os.mkfifo(os.path.join(forkdir, n))
-        handle = ForkHandle(self.name, command, forkdir)
+        handle = ForkHandle(self.name, command, forkdir, cast=cast)
         try:
             r = self.run(
                 f"__qua_fork {shlex.quote(forkdir)} {shlex.quote(command)}",
@@ -485,6 +617,8 @@ class Session:
             handle.pid = int(r.text.strip().splitlines()[-1])
         except Exception:
             shutil.rmtree(forkdir, ignore_errors=True)
+            if cast is not None:
+                cast.close()
             raise
         if not handle._opened.wait(10):
             raise RuntimeError(f"fork streams never connected: {command!r}")
@@ -492,6 +626,42 @@ class Session:
 
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)
+
+    def _input(self, data: bytes, record: bool = True) -> None:
+        """Every user/programmatic keystroke funnels through here: recording
+        (with termios ECHO auto-suppression), interceptor on_input hooks,
+        then the PTY."""
+        self._recorder.input(data, record=record, echoed=self._echo_on())
+        for itc, ctx in list(self._iactive):
+            fn = getattr(itc, "on_input", None)
+            if fn is not None:
+                try:
+                    fn(ctx, data)
+                except Exception:
+                    pass
+        self._write(data)
+
+    def _echo_on(self) -> Optional[bool]:
+        """Whether the shell is about to echo what we type: False only for
+        canonical no-echo mode (ICANON on, ECHO off) — the classic
+        getpass()/``read -s`` idiom used by local password prompts, including
+        sudo with pwfeedback (which paints its own ``*``s).
+
+        Readline (and any full-screen app) also clears the kernel ECHO bit,
+        but only as part of switching to raw mode (ICANON off) so it can do
+        its own character-by-character echo — that state is excluded (return
+        None) or normal command typing would be auto-suppressed as if it were
+        a secret.
+        """
+        try:
+            import termios
+
+            lflag = termios.tcgetattr(self._proc.fd)[3]
+            if not (lflag & termios.ICANON):
+                return None  # raw mode: not classifiable this way
+            return bool(lflag & termios.ECHO)
+        except Exception:
+            return None
 
     # ----------------------------------------------------------- Popen face
     @property
@@ -526,17 +696,79 @@ class Session:
 
     def interrupt(self) -> None:
         """Ctrl-C through the PTY (goes to the foreground process group)."""
-        self._write(b"\x03")
+        self._input(b"\x03")
 
     def send(self, data, record: bool = True) -> None:
-        self._write(data if isinstance(data, bytes) else str(data).encode())
+        self._input(data if isinstance(data, bytes) else str(data).encode(), record=record)
 
     def sendline(self, line: str = "", record: bool = True) -> None:
-        self._write(line.encode() + b"\r")
+        self._input(line.encode() + b"\r", record=record)
 
     def resize(self, rows: int, cols: int) -> None:
         self._rows, self._cols = rows, cols
         self._proc.setwinsize(rows, cols)
+        self._recorder.resize(rows, cols)
+        if self._mirror is not None:
+            with self._lock:
+                self._mirror.resize(rows, cols)
+
+    # ------------------------------------------------------- recording (§6)
+    @property
+    def recording(self) -> bool:
+        return self._recorder.recording
+
+    @property
+    def cast_path(self) -> Optional[Path]:
+        """The asciicast v2 sidecar this session records to, if any."""
+        return self._recorder.cast_path
+
+    def record(self, on: bool = True) -> None:
+        """Runtime toggle: start/resume or pause recording. The first
+        ``record(True)`` opens the .cast sidecar next to the notebook."""
+        if on:
+            self._recorder.start(self._rows, self._cols)
+        else:
+            self._recorder.set_enabled(False)
+
+    def erase(self, count: int = 1) -> int:
+        """⌫: redact the most recent keystroke(s) from the recording. Works on
+        anything still inside the delayed-flush tail, regardless of what was
+        or wasn't echoed. Returns how many events were rewritten."""
+        return self._recorder.erase(count)
+
+    def screenshot(self) -> Note:
+        """Dump the current screen as preformatted text into the anchor cell's
+        transcript (works with no view attached); returns the Note."""
+        if self._mirror is None:
+            raise RuntimeError("screenshots need the 'pyte' package")
+        with self._lock:
+            text = self._mirror.snapshot()
+        stamp = _dt.datetime.now().strftime("%H:%M:%S")
+        note = Note(f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}")
+        if self._transcript is not None:
+            self._transcript.append(note)
+            self._update_transcript()
+        return note
+
+    def _on_rec_event(self, kind: str, **kw) -> None:
+        if kind == "echo":
+            # An un-echoed or masked keystroke: flash the ⌫ affordance —
+            # a prompt, not an action (PLAN.md §6).
+            self._emit({"type": "echo", "cls": kw.get("cls")}, [])
+        elif kind == "state":
+            self._emit_rec_state()
+
+    def _emit_rec_state(self) -> None:
+        p = self._recorder.cast_path
+        self._emit(
+            {
+                "type": "rec-state",
+                "started": p is not None,
+                "recording": self._recorder.recording,
+                "cast": str(p) if p is not None else "",
+            },
+            [],
+        )
 
     def close(self) -> None:
         self.terminate()
@@ -548,6 +780,7 @@ class Session:
         self._cleanup()
 
     def _cleanup(self) -> None:
+        self._recorder.close()
         tmp = getattr(self, "_tmpdir", None)
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -588,11 +821,23 @@ class Session:
             scrollback = self._ring.dump()
             if scrollback:
                 self._emit({"type": "out"}, [scrollback])
+            self._emit_rec_state()
+            if self.altscreen:
+                self._emit({"type": "altscreen", "on": True}, [])
             if self._exited.is_set():
                 self._emit({"type": "exited", "code": self._returncode}, [])
         elif kind == "stdin":
             if not self._exited.is_set():
-                self._write(content.get("data", "").encode())
+                self._input(content.get("data", "").encode())
+        elif kind == "pause":
+            self.record(not self._recorder.recording)
+        elif kind == "erase":
+            self.erase()
+        elif kind == "screenshot":
+            try:
+                self.screenshot()
+            except Exception:
+                pass
         elif kind == "resize":
             rows, cols = int(content.get("rows", 24)), int(content.get("cols", 80))
             if (rows, cols) != (self._rows, self._cols):
@@ -614,6 +859,12 @@ class Session:
             self._widget = None
         display(self._view())
         self._transcript = Transcript(self.name)
+        cast = self._recorder.cast_path
+        if cast is not None:
+            try:
+                self._transcript.cast = os.path.relpath(cast)
+            except ValueError:
+                self._transcript.cast = str(cast)
         self._thandle = display(self._transcript, display_id=True)
 
     # ------------------------------------------------------------ integration

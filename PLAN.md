@@ -74,7 +74,7 @@ systemctl --user restart app
 | Local PTY (windows) | **pywinpty** (ConPTY) | Real TTY for cmd.exe, PowerShell, and `wsl.exe` |
 | Command boundaries | **OSC 133** shell integration | In-band → works over ssh; industry standard |
 | Cell creation | **IPython `set_next_input` payload** (+ **ipylab** fast path when in Lab) | Kernel-side, works in VS Code; see §5 |
-| Session recording | **asciicast v2** written by our own tap; **asciinema-player** for replay | Timestamped, committable, replayable |
+| Session recording | **asciicast v2** written by our own tap; replay via the `asciinema` CLI (out of scope: an in-notebook player) | Timestamped, committable, replayable |
 | Remote transport | **system OpenSSH** in a PTY + **ControlMaster**; **tmux control mode** (`-CC`) for implied sessions | Respects ~/.ssh/config, agents, ProxyJump |
 | Screen state | **pyte** | Kernel-side "what's on screen" for prompt heuristics & screenshots |
 

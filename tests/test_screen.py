@@ -1,0 +1,96 @@
+"""Kernel-side screen state (PLAN.md §4/§6): screenshots and alt-screen."""
+
+import sys
+import time
+
+import pytest
+
+import quahog
+from quahog.screen import ScreenMirror
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
+
+
+def _wait(pred, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.fixture()
+def sh():
+    s = quahog.bash(inherit_rc=False)
+    yield s
+    s.close()
+    quahog.sessions.pop(s.name, None)
+
+
+# ---------------------------------------------------------------- unit level
+
+
+def test_mirror_snapshot_reflects_output():
+    m = ScreenMirror(24, 80)
+    m.feed(b"hello world\r\n")
+    assert "hello world" in m.snapshot()
+
+
+def test_mirror_carriage_return_overwrite():
+    m = ScreenMirror(24, 80)
+    m.feed(b"aaaaa\rbb")
+    assert m.snapshot().splitlines()[0] == "bbaaa"
+
+
+def test_mirror_altscreen_transitions():
+    m = ScreenMirror(24, 80)
+    assert m.feed(b"normal text") is None
+    assert m.altscreen is False
+    assert m.feed(b"\x1b[?1049h") is True
+    assert m.altscreen is True
+    assert m.feed(b"in the app") is None  # no change, no signal
+    assert m.feed(b"\x1b[?1049l") is False
+    assert m.altscreen is False
+
+
+def test_mirror_altscreen_split_across_reads():
+    """The switch sequence split across two feeds is still detected."""
+    m = ScreenMirror(24, 80)
+    assert m.feed(b"\x1b[?10") is None
+    assert m.feed(b"49h") is True
+    assert m.altscreen is True
+
+
+# ---------------------------------------------------------------- session
+
+
+def test_screenshot_into_transcript(sh):
+    from quahog.minutes import Transcript, Note
+
+    sh._transcript = Transcript(sh.name)
+    sh.run("echo on-the-screen")
+    assert _wait(lambda: "on-the-screen" in sh._mirror.snapshot())
+    note = sh.screenshot()
+    assert isinstance(note, Note)
+    assert "on-the-screen" in note.text
+    assert note in sh._transcript.blocks
+
+
+def test_altscreen_blocks_run(sh):
+    """While a full-screen app owns the alt-screen, run() refuses."""
+    # Emulate an app entering the alt-screen without needing a real TUI.
+    sh.run("printf '\\033[?1049h'")
+    assert _wait(lambda: sh.altscreen is True)
+    with pytest.raises(RuntimeError, match="full-screen"):
+        sh.run("echo nope")
+    # Leaving the alt-screen re-enables run().
+    sh.send("printf '\\033[?1049l'\r")
+    assert _wait(lambda: sh.altscreen is False)
+    assert sh.run("echo back").text.strip() == "back"
+
+
+def test_screenshot_without_pyte_errors(sh, monkeypatch):
+    monkeypatch.setattr(sh, "_mirror", None)
+    with pytest.raises(RuntimeError, match="pyte"):
+        sh.screenshot()

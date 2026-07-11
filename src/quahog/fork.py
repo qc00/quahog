@@ -22,9 +22,11 @@ from .result import clean_text
 class _Drain(threading.Thread):
     """Reads one FIFO to EOF into a buffer, so writers never block."""
 
-    def __init__(self, path: str, label: str) -> None:
+    def __init__(self, path: str, label: str, on_data=None, on_eof=None) -> None:
         super().__init__(name=f"quahog-fork-{label}", daemon=True)
         self._path = path
+        self._on_data = on_data
+        self._on_eof = on_eof
         self.buf = bytearray()
 
     def run(self) -> None:
@@ -35,16 +37,26 @@ class _Drain(threading.Thread):
                 if not chunk:
                     break
                 self.buf += chunk
+                if self._on_data is not None:
+                    try:
+                        self._on_data(chunk)
+                    except Exception:
+                        pass
         except OSError:
             pass
         finally:
             os.close(fd)
+            if self._on_eof is not None:
+                try:
+                    self._on_eof()
+                except Exception:
+                    pass
 
 
 class ForkHandle:
     """Popen-shaped handle for one forked command."""
 
-    def __init__(self, session_name: str, command: str, dirpath: str) -> None:
+    def __init__(self, session_name: str, command: str, dirpath: str, cast=None) -> None:
         self.session_name = session_name
         self.command = command
         self.pid: Optional[int] = None
@@ -53,8 +65,17 @@ class ForkHandle:
         self._stdin_fd: Optional[int] = None
         self._opened = threading.Event()
 
-        self._out = _Drain(os.path.join(dirpath, "1"), "out")
-        self._err = _Drain(os.path.join(dirpath, "2"), "err")
+        # Optional recording (PLAN.md §6): a fork gets its own .cast file.
+        # Both streams tee into it as output events; the writer closes when
+        # both hit EOF.
+        self._cast = cast
+        self._cast_lock = threading.Lock()
+        self._cast_open_streams = 2
+        tee = self._tee if cast is not None else None
+        eof = self._stream_eof if cast is not None else None
+
+        self._out = _Drain(os.path.join(dirpath, "1"), "out", on_data=tee, on_eof=eof)
+        self._err = _Drain(os.path.join(dirpath, "2"), "err", on_data=tee, on_eof=eof)
 
         # FIFO opens block until the peer opens; the shell side opens its
         # redirects in 0,1,2 order, so we must open in the same order — and in
@@ -88,10 +109,31 @@ class ForkHandle:
     def stderr(self) -> str:
         return self.stderr_bytes.decode("utf-8", "replace")
 
+    def _tee(self, chunk: bytes) -> None:
+        with self._cast_lock:
+            if self._cast is not None:
+                self._cast.append("o", chunk.decode("utf-8", "replace"))
+
+    def _stream_eof(self) -> None:
+        with self._cast_lock:
+            self._cast_open_streams -= 1
+            if self._cast_open_streams <= 0 and self._cast is not None:
+                self._cast.close()
+
+    @property
+    def cast_path(self):
+        return self._cast.path if self._cast is not None else None
+
     def send(self, data, record: bool = True) -> None:
         if self._stdin_fd is None:
             raise RuntimeError("stdin not connected yet")
-        os.write(self._stdin_fd, data if isinstance(data, bytes) else str(data).encode())
+        raw = data if isinstance(data, bytes) else str(data).encode()
+        with self._cast_lock:
+            if self._cast is not None:
+                from .record import PLACEHOLDER
+
+                self._cast.append("i", raw.decode("utf-8", "replace") if record else PLACEHOLDER)
+        os.write(self._stdin_fd, raw)
 
     def sendline(self, line: str = "", record: bool = True) -> None:
         self.send(line + "\n")
@@ -159,6 +201,9 @@ class ForkHandle:
 
     def close(self) -> None:
         self.close_stdin()
+        with self._cast_lock:
+            if self._cast is not None:
+                self._cast.close()
         shutil.rmtree(self._dir, ignore_errors=True)
 
     # ------------------------------------------------------------- display

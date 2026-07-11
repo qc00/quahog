@@ -15,8 +15,8 @@
 
 .qua-bar {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 6px;
   padding: 2px 8px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 11px;
@@ -25,6 +25,73 @@
   border-bottom: 1px solid rgba(128, 128, 128, 0.25);
   user-select: none;
   flex: 0 0 auto;
+}
+
+.qua-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qua-tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.qua-btn {
+  background: none;
+  border: none;
+  margin: 0;
+  padding: 2px 3px;
+  color: #9aa0ae;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 0;
+}
+
+.qua-btn:hover:not(:disabled) {
+  color: #e6e9ef;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.qua-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.qua-btn.qua-rec-on {
+  color: #e06c75;
+}
+
+.qua-btn.qua-hot {
+  color: #e5c07b;
+}
+
+.qua-badge {
+  background: #3a3f4b;
+  color: #d8dee9;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+@keyframes qua-flash {
+  0%,
+  100% {
+    background: transparent;
+    color: #9aa0ae;
+  }
+  35% {
+    background: #e06c75;
+    color: #fff;
+  }
+}
+
+.qua-btn.qua-flash {
+  animation: qua-flash 0.8s ease;
 }
 
 .qua-body {

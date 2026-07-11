@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Optional
 
+from . import interceptors  # noqa: F401
 from .fork import ForkHandle  # noqa: F401
+from .minutes import Note  # noqa: F401
 from .result import CommandResult, MultiResult, clean_text  # noqa: F401
 from .session import (  # noqa: F401
     LAST_DUMP,
@@ -21,7 +23,7 @@ from .session import (  # noqa: F401
     spawn_zsh,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = [
     "bash",
     "zsh",
@@ -33,8 +35,10 @@ __all__ = [
     "MultiResult",
     "ForkHandle",
     "Minute",
+    "Note",
     "LAST_DUMP",
     "TimeoutExpired",
+    "interceptors",
 ]
 
 
