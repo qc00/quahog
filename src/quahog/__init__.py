@@ -12,9 +12,16 @@ from typing import Optional
 
 from .fork import ForkHandle  # noqa: F401
 from .result import CommandResult, MultiResult, clean_text  # noqa: F401
-from .session import Session, TimeoutExpired, spawn_bash, spawn_zsh
+from .session import (  # noqa: F401
+    LAST_DUMP,
+    Minute,
+    Session,
+    TimeoutExpired,
+    spawn_bash,
+    spawn_zsh,
+)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "bash",
     "zsh",
@@ -25,6 +32,8 @@ __all__ = [
     "CommandResult",
     "MultiResult",
     "ForkHandle",
+    "Minute",
+    "LAST_DUMP",
     "TimeoutExpired",
 ]
 
@@ -88,10 +97,8 @@ def attach(name: str) -> Session:
 
 def load_ipython_extension(ip) -> None:
     from .magics import load_ipython_extension as _load
-    from .minutes import register as _register_minutes
 
     _load(ip)
-    _register_minutes(ip)
 
 
 def _auto_register_magics() -> None:

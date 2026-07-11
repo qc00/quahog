@@ -64,18 +64,14 @@ def test_minuting_wire_protocol(kernel):
     # Anchor display: widget view + transcript display (with display_id).
     _, iopub = execute(
         kc,
-        "import quahog as q\n"
-        "h = q.bash(inherit_rc=False)\n"
-        "h._ipython_display_()\n",
+        "import quahog as q\n" "h = q.bash(inherit_rc=False)\n" "h._ipython_display_()\n",
         settle=0.5,
     )
     displays = _displays(iopub)
-    widget_views = [
-        m for m in displays
-        if "application/vnd.jupyter.widget-view+json" in m["content"]["data"]
-    ]
+    widget_views = [m for m in displays if "application/vnd.jupyter.widget-view+json" in m["content"]["data"]]
     transcripts = [
-        m for m in displays
+        m
+        for m in displays
         if m["content"].get("transient", {}).get("display_id")
         and "application/vnd.jupyter.widget-view+json" not in m["content"]["data"]
     ]
@@ -89,7 +85,8 @@ def test_minuting_wire_protocol(kernel):
     # cell's reply instead of the next one.
     _, iopub = execute(kc, "h.sendline('echo minuted-live')", settle=2.0)
     updates = [
-        m for m in _displays(iopub, "update_display_data")
+        m
+        for m in _displays(iopub, "update_display_data")
         if m["content"].get("transient", {}).get("display_id") == display_id
     ]
     assert updates, "no update_display_data arrived for the transcript"
@@ -97,13 +94,19 @@ def test_minuting_wire_protocol(kernel):
     assert "$ echo minuted-live" in text
     assert "minuted-live" in text
 
-    # Next execution flushes the minute queue as a set_next_input payload.
-    reply, _ = execute(kc, "1 + 1")
+    # Explicit dump: the set_next_input payload rides the dumping cell's own
+    # reply — the only payload timing every frontend (incl. VS Code) honors.
+    reply, _ = execute(kc, "h.dump_minutes_as_cell()")
     payloads = reply["content"].get("payload", [])
     sni = [p for p in payloads if p.get("source") == "set_next_input"]
     assert sni, f"no set_next_input payload in reply: {payloads!r}"
     assert sni[0]["text"] == "%qua echo minuted-live"
     assert sni[0]["replace"] is False
+
+    # A second dump with nothing new adds no payload.
+    reply, _ = execute(kc, "h.dump_minutes_as_cell()")
+    payloads = reply["content"].get("payload", [])
+    assert not [p for p in payloads if p.get("source") == "set_next_input"]
 
 
 def test_hop_new_transcript_wire_protocol(kernel):
@@ -111,7 +114,8 @@ def test_hop_new_transcript_wire_protocol(kernel):
     # Hop: display again → fresh transcript display_id.
     _, iopub = execute(kc, "h._ipython_display_()", settle=0.5)
     transcripts = [
-        m for m in _displays(iopub)
+        m
+        for m in _displays(iopub)
         if m["content"].get("transient", {}).get("display_id")
         and "application/vnd.jupyter.widget-view+json" not in m["content"]["data"]
     ]
@@ -124,7 +128,8 @@ def test_hop_new_transcript_wire_protocol(kernel):
         settle=1.5,
     )
     updates = [
-        m for m in _displays(iopub, "update_display_data")
+        m
+        for m in _displays(iopub, "update_display_data")
         if m["content"].get("transient", {}).get("display_id") == new_id
     ]
     assert updates, "no transcript update for the hopped anchor"

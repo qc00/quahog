@@ -8,6 +8,8 @@ CommandResult text; the widget is a pure client-side view.
 
 from __future__ import annotations
 
+import codecs
+import datetime as _dt
 import os
 import shlex
 import shutil
@@ -16,12 +18,41 @@ import tempfile
 import threading
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, NamedTuple, Optional, Union
 
 from .fork import ForkHandle
 from .minutes import Transcript
 from .osc import StreamParser
-from .result import CommandResult
+from .result import CommandResult, clean_text
+
+
+class _LastDump:
+    """Sentinel: 'everything since the previous dump' (see Session.last_dump)."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "LAST_DUMP"
+
+
+LAST_DUMP = _LastDump()
+
+
+class Minute(NamedTuple):
+    """One interactively typed command. ``raw`` and ``text`` are slice objects
+    into the session-lifetime streams ``Session.raw`` / ``Session.text``."""
+
+    when: _dt.datetime
+    command: str
+    raw: slice
+    text: slice
+    returncode: Optional[int] = None
+
 
 _INJECT_DIR = Path(__file__).parent / "inject"
 
@@ -31,10 +62,7 @@ class TimeoutExpired(TimeoutError):
     CommandResult is available as .result and will complete in the background."""
 
     def __init__(self, result: CommandResult, timeout: float) -> None:
-        super().__init__(
-            f"command did not finish in {timeout}s (still running): "
-            f"{result.command!r}"
-        )
+        super().__init__(f"command did not finish in {timeout}s (still running): " f"{result.command!r}")
         self.result = result
 
 
@@ -111,9 +139,7 @@ class Session:
         if env:
             full_env.update(env)
 
-        self._proc = PtyProcess.spawn(
-            list(argv), cwd=cwd, env=full_env, dimensions=(rows, cols)
-        )
+        self._proc = PtyProcess.spawn(list(argv), cwd=cwd, env=full_env, dimensions=(rows, cols))
         self._rows, self._cols = rows, cols
         self._parser = StreamParser()
         self._ring = _Ring()
@@ -129,17 +155,29 @@ class Session:
 
         # Minuting (PLAN.md §5): interactive commands are captured between the
         # shell integration's C and D markers; the typed text arrives on the
-        # private OSC 5522;E channel.
-        self.minutes = True
+        # private OSC 5522;E channel. Each one appends a Minute to `minutes`
+        # whose raw/text slices index the session-lifetime streams below.
+        self.minuting = True
+        self.minutes: List[Minute] = []
+        self.last_dump = 0
         self._icap: Optional[CommandResult] = None
+        self._icap_marks: Optional[tuple] = None  # (raw_start, text_start)
         self._typed_cmd: Optional[str] = None
-        self._minute_q: deque = deque()
         self._transcript: Optional[Transcript] = None
         self._thandle = None
 
-        self._reader = threading.Thread(
-            target=self._read_loop, name=f"quahog-{name}", daemon=True
-        )
+        # Session-lifetime streams. `raw` is the decoded data stream with
+        # markers stripped but escapes kept; `text` is its cleaned form,
+        # materialized up to the last command boundary (unbounded by design —
+        # they are what Minute slices point into).
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._raw_parts: List[str] = []
+        self._raw_len = 0
+        self._unflushed: List[str] = []
+        self._text_parts: List[str] = []
+        self._text_len = 0
+
+        self._reader = threading.Thread(target=self._read_loop, name=f"quahog-{name}", daemon=True)
         self._reader.start()
         # Wait for the first prompt marker so run() right after construction
         # doesn't race shell startup.
@@ -172,8 +210,38 @@ class Session:
             self._emit({"type": "out"}, [data])
         self._on_exit()
 
+    def _ingest(self, b: bytes) -> None:
+        s = self._decoder.decode(b)
+        if s:
+            self._raw_parts.append(s)
+            self._raw_len += len(s)
+            self._unflushed.append(s)
+
+    def _text_boundary(self) -> int:
+        """Materialize the clean-text stream up to 'now'; return its length.
+        Called at command boundaries (C/D), which sit at line edges, so
+        carriage-return overlays never straddle the flush point in practice."""
+        if self._unflushed:
+            cleaned = clean_text("".join(self._unflushed))
+            self._unflushed.clear()
+            self._text_parts.append(cleaned)
+            self._text_len += len(cleaned)
+        return self._text_len
+
+    def _close_icap(self, rc: Optional[int]) -> None:
+        icap, self._icap = self._icap, None
+        marks, self._icap_marks = self._icap_marks, None
+        if not icap.command:
+            icap.command = self._typed_cmd or ""
+        self._typed_cmd = None
+        icap._finish(rc)
+        raw_s = slice(marks[0], self._raw_len) if marks else slice(0, 0)
+        text_s = slice(marks[1], self._text_boundary()) if marks else slice(0, 0)
+        self._record_interactive(icap, raw_s, text_s)
+
     def _on_token(self, tok) -> None:
         if tok[0] == "data":
+            self._ingest(tok[1])
             target = self._active if self._active is not None else self._icap
             if target is not None and target._capturing:
                 target._buf += tok[1]
@@ -190,6 +258,7 @@ class Session:
                     # delivers it in precmd, just before D.
                     self._icap = CommandResult(self.name, self._typed_cmd or "")
                     self._icap._capturing = True
+                    self._icap_marks = (self._raw_len, self._text_boundary())
                     self._typed_cmd = None
             elif code == "D":
                 parts = payload.split(";")
@@ -201,20 +270,13 @@ class Session:
                     self._typed_cmd = None
                     active._finish(rc)
                 elif self._icap is not None:
-                    icap, self._icap = self._icap, None
-                    if not icap.command:
-                        icap.command = self._typed_cmd or ""
-                    self._typed_cmd = None
-                    icap._finish(rc)
-                    self._record_interactive(icap)
+                    self._close_icap(rc)
             elif code in ("A", "B"):
                 if code == "A" and self._icap is not None:
                     # A fresh prompt while a capture is still open: the command
                     # never produced a D (exec, exit into a nested shell, lost
                     # integration). Close it out honestly.
-                    icap, self._icap = self._icap, None
-                    icap._finish(None)
-                    self._record_interactive(icap)
+                    self._close_icap(None)
                 self._at_prompt.set()
         elif num == "5522":
             kind, _, rest = payload.partition(";")
@@ -229,7 +291,7 @@ class Session:
             if slash != -1:
                 self.cwd = rest[slash:]
 
-    def _record_interactive(self, result: CommandResult) -> None:
+    def _record_interactive(self, result: CommandResult, raw_s: slice, text_s: slice) -> None:
         command = result.command.strip()
         if not command:
             return
@@ -239,14 +301,102 @@ class Session:
         if transcript is not None:
             transcript.append(result)
             self._update_transcript()
-        if self.minutes:
-            self._minute_q.append(result)
+        if self.minuting:
+            self.minutes.append(
+                Minute(
+                    when=_dt.datetime.now(),
+                    command=command,
+                    raw=raw_s,
+                    text=text_s,
+                    returncode=result.returncode,
+                )
+            )
 
-    def _drain_minutes(self) -> List[CommandResult]:
-        out = []
-        while self._minute_q:
-            out.append(self._minute_q.popleft())
-        return out
+    # ------------------------------------------------------ lifetime streams
+    @property
+    def raw(self) -> str:
+        """The session's data stream since start: escapes kept, markers
+        stripped. Minute.raw slices index into this."""
+        with self._lock:
+            return "".join(self._raw_parts)
+
+    @property
+    def text(self) -> str:
+        """Clean-text form of ``raw``. Minute.text slices index into this."""
+        with self._lock:
+            done = "".join(self._text_parts)
+            tail = clean_text("".join(self._unflushed)) if self._unflushed else ""
+        return done + tail
+
+    def dump_minutes_as_cell(
+        self,
+        since: Union[int, _dt.date, _dt.datetime, _LastDump] = LAST_DUMP,
+        until: Union[int, _dt.date, _dt.datetime, None] = None,
+        prefix_per_cmd: Optional[bool] = True,
+    ) -> None:
+        """Turn tracked interactive commands into a new (unexecuted) cell.
+
+        ``since``/``until`` select from ``self.minutes`` — by list index, by
+        date/datetime, or (the default) everything since the previous dump
+        (``LAST_DUMP`` sentinel; the resolved index lives in ``self.last_dump``).
+        ``prefix_per_cmd``: True → one ``%qua cmd`` line each (easy to split
+        into separate cells); False → a single ``%%qua`` header; None → bare
+        commands.
+
+        The cell is created via a ``set_next_input`` payload riding the
+        current execution, which works in JupyterLab *and* VS Code — but
+        frontends honor only one payload per execution, so call this once per
+        cell.
+        """
+        with self._lock:
+            entries = list(self.minutes)
+
+        def _index(bound, default: int) -> int:
+            if bound is None:
+                return default
+            if isinstance(bound, _LastDump):
+                return min(self.last_dump, len(entries))
+            if isinstance(bound, int):
+                return bound
+            if isinstance(bound, _dt.datetime):
+                dt = bound
+            elif isinstance(bound, _dt.date):
+                dt = _dt.datetime.combine(bound, _dt.time.min)
+            else:
+                raise TypeError(f"unsupported bound: {bound!r}")
+            for i, m in enumerate(entries):
+                if m.when >= dt:
+                    return i
+            return len(entries)
+
+        start = _index(since, 0)
+        end = _index(until, len(entries))
+        selected = entries[start:end]
+        self.last_dump = end if end >= 0 else len(entries) + end
+        if not selected:
+            return
+
+        import quahog
+
+        is_default = quahog.default is self
+        commands = [m.command for m in selected]
+        if prefix_per_cmd is True:
+            prefix = "%qua " if is_default else f"%qua -s {self.name} "
+            text = "\n".join(prefix + c for c in commands)
+        elif prefix_per_cmd is False:
+            head = "%%qua" if is_default else f"%%qua {self.name}"
+            text = head + "\n" + "\n".join(commands)
+        else:
+            text = "\n".join(commands)
+
+        try:
+            from IPython import get_ipython
+
+            ip = get_ipython()
+            if ip is not None and getattr(ip, "payload_manager", None) is not None:
+                ip.payload_manager.write_payload({"source": "set_next_input", "text": text, "replace": False})
+        except Exception:
+            pass
 
     def _update_transcript(self) -> None:
         handle, transcript = self._thandle, self._transcript
@@ -275,6 +425,8 @@ class Session:
             self._returncode = -self._proc.signalstatus
         with self._lock:
             active, self._active = self._active, None
+            if self._icap is not None:
+                self._close_icap(self._returncode)
         if active is not None:
             active._finish(self._returncode)
         self._exited.set()
@@ -294,20 +446,15 @@ class Session:
         if not command:
             raise ValueError("empty command")
         if "\n" in command:
-            raise ValueError(
-                "multi-line commands are not supported yet; use %%qua or join with '&&'"
-            )
+            raise ValueError("multi-line commands are not supported yet; use %%qua or join with '&&'")
         if self._exited.is_set():
             raise RuntimeError(f"session {self.name!r} has exited")
         with self._lock:
             if self._active is not None:
-                raise RuntimeError(
-                    f"session {self.name!r} is busy running: {self._active.command!r}"
-                )
+                raise RuntimeError(f"session {self.name!r} is busy running: {self._active.command!r}")
             if self._icap is not None:
                 raise RuntimeError(
-                    f"session {self.name!r} is busy with an interactive command: "
-                    f"{self._icap.command!r}"
+                    f"session {self.name!r} is busy with an interactive command: " f"{self._icap.command!r}"
                 )
             result = CommandResult(self.name, command)
             self._active = result
@@ -487,25 +634,18 @@ class Session:
                 self.sendline("setopt no_bang_hist # __qua_reinject")
             else:
                 self.sendline("set +H # __qua_reinject")
-            lines = [
-                ln
-                for ln in path.read_text().splitlines()
-                if ln.strip() and not ln.lstrip().startswith("#")
-            ]
+            lines = [ln for ln in path.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
             self.sendline(" ; ".join(lines))
         else:
             self.sendline(f". '{path}'")
 
     def __repr__(self) -> str:
-        state = (
-            f"exited {self._returncode}"
-            if self._exited.is_set()
-            else ("busy" if self._active else "at prompt")
-        )
+        state = f"exited {self._returncode}" if self._exited.is_set() else ("busy" if self._active else "at prompt")
         return f"<quahog.Session {self.name} ({self.shell_kind}, pid {self.pid}, {state})>"
 
 
 # ----------------------------------------------------------------- factories
+
 
 def _rcfile_bash(tmpdir: str, inherit_rc: bool) -> str:
     path = os.path.join(tmpdir, "bashrc")

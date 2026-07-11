@@ -184,41 +184,39 @@ step two
 
 ---
 
-## 5. Interactive commands become cells
+## 5. Minuting interactive commands to cells
 
 When the user types a command into the widget of a supported shell, the tap assembles
 `{command, output, exit_code, cwd}` from the OSC 133 markers — identical shape to a `run()`.
-Getting that into a *cell* is the frontend-dependent part. Comparing the approaches from
-[bront.rodeo's write-up](https://blog.bront.rodeo/programmatically-creating-input-cells-in-jupyter-notebooks/)
-against our constraint (**must work in VS Code**):
+Getting that into a *cell* is the frontend-dependent part:
 
 | Approach | Works in Lab/NB7 | Works in VS Code | Fit |
 |---|---|---|---|
-| `get_ipython().set_next_input(text)` — kernel payload | ✅ | ✅ (vscode-jupyter implements the payload; it's how `%load` works) | **Primary.** Code-cells-only limitation is irrelevant — we only ever create code cells |
-| JupyterLab `app:commands` (via ipylab) | ✅ | ❌ | Fast path when available |
-| ipywidgets HTML display hack | n/a — renders *output*, not an input cell | n/a | Rejected; our outputs already handle display |
+| `get_ipython().set_next_input(text)` | ✅ | ⚠️ see note | Unsatisfactory, but only way to work in VS Code |
+| JupyterLab `app:commands` (via ipylab) | ✅ | ❌ | Dropped — manual dump removed the need for a fast path |
 
-The catch the blog doesn't hit: `set_next_input` rides on an `execute_reply` **payload**, so it
-can only fire when some cell finishes executing — and interactive typing happens *between*
-executions. Design around it:
+Note: `set_next_input` rides on an `execute_reply` **payload**, so payloads written *between*
+executions never render, and when several are written in one execution **VS Code honors only
+the last**.
 
-- **Output stays in the anchor cell — always.** The cell that displayed the session holds a
+- **Output stays in the anchor cell.** The cell that displayed the session holds a
   *transcript* display handle; each interactive command's `{command, output, exit}` is appended
-  there as text via `update_display_data` (which frontends persist into the notebook). The
-  durable record never depends on cell creation. After a hop, future transcript lines target
+  there as text via `update_display_data` (which frontends persist into the notebook).
+  After a hop, future transcript lines target
   the new anchor cell — matching hop's contract that the old cell retains its era's history.
-- **Cell creation is then just a retry convenience.** The kernel queues commands; on the next
-  execution of any cell, the queue flushes via `set_next_input` into *unexecuted*
-  `%qua <command>` cells (batch → one `%%qua` cell). Running such a cell executes the command
-  for real — no replay cache, no special first-run semantics. With ipylab (Lab/NB7) the cells
-  appear immediately instead of on next execution.
-- If a frontend turns out not to honor `update_display_data` after the anchor cell finished
-  executing, degradation is graceful: the kernel re-emits the transcript at the next execution,
-  the same moment the cell queue flushes anyway.
-- Toggle: `h.minutes = True/False` — the feature is called **minuting**, as in writing the
-  meeting minutes; deliberately nothing like the word "record", which §6 owns for keystroke
-  recording — plus a widget toolbar button. Commands typed while input suppression is active
-  (§6) are never minuted.
+- **`h.minutes` list** Every interactive command appends a
+  `Minute` NamedTuple: `when` (timestamp), `command`, and `raw`/`text` **slice objects**
+  indexing into the handle's session-lifetime streams `h.raw` and `h.text`, so `h.text[m.text]` is that command's output.
+- **Cell creation is explicit:**
+  `h.dump_minutes_as_cell(since=LAST_DUMP, until=None, prefix_per_cmd=True)`.
+  `since`/`until` accept a list index, a date/datetime, or the `LAST_DUMP` sentinel (the index
+  after the last dumped entry, also readable as `h.last_dump`). `prefix_per_cmd`: `True` →
+  one `%qua cmd` line per command (easy to split into cells); `False` → a single `%%qua`
+  header; `None` → bare commands. Returns the text.
+- Toggle: `h.minuting = True/False` (plus a widget toolbar button later) — it only controls
+  appending to the list. The feature is called **minuting**, as in writing the meeting
+  minutes; deliberately nothing like the word "record", which §6 owns for keystroke recording.
+  Commands typed while input suppression is active (§6) are never minuted.
 
 ---
 

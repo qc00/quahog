@@ -47,8 +47,22 @@ q.sessions            # registry; q.attach("bash1"); q.default
 
 Minuting: commands you type *into the embedded console* are captured — their
 output is appended as plain text to the cell that displayed the console (the
-transcript), and on your next cell execution an unexecuted `%qua <command>`
-cell appears so the command can be re-run later. Toggle with `h.minutes`.
+transcript), and each one is tracked in `h.minutes`, a list of
+`Minute(when, command, raw, text, returncode)` where `raw`/`text` are slice
+objects into the session-lifetime streams `h.raw` / `h.text` (so
+`h.text[m.text]` is that command's output). Turn them into a notebook cell
+explicitly:
+
+```python
+h.dump_minutes_as_cell()                  # everything since the last dump
+h.dump_minutes_as_cell(since=0)           # or by index / date / datetime
+h.dump_minutes_as_cell(prefix_per_cmd=False)  # one %%qua block instead of %qua lines
+```
+
+The new cell is created via a `set_next_input` payload riding the calling
+cell's execution — the only payload timing JupyterLab *and* VS Code honor
+(payloads written between executions are dropped; only the last per execution
+wins). One dump per cell. Toggle capture with `h.minuting`.
 Displaying `h` again in another cell *hops* the live console there; the old
 view freezes into a static snapshot.
 

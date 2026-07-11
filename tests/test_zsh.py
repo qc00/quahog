@@ -6,9 +6,7 @@ import pytest
 
 import quahog
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32" or not shutil.which("zsh"), reason="needs zsh"
-)
+pytestmark = pytest.mark.skipif(sys.platform == "win32" or not shutil.which("zsh"), reason="needs zsh")
 
 
 @pytest.fixture()
@@ -29,12 +27,14 @@ def test_zsh_run(zs):
 def test_zsh_interactive_minuted(zs):
     zs.sendline("echo zsh-typed")
     deadline = time.monotonic() + 5
-    while not zs._minute_q and time.monotonic() < deadline:
+    while not zs.minutes and time.monotonic() < deadline:
         time.sleep(0.05)
-    q = zs._drain_minutes()
-    assert q, "zsh interactive command not captured"
-    assert q[0].command == "echo zsh-typed"
-    assert "zsh-typed" in q[0].text
+    assert zs.minutes, "zsh interactive command not captured"
+    m = zs.minutes[0]
+    assert m.command == "echo zsh-typed"
+    assert zs.text[m.text].strip() == "zsh-typed"
+    assert zs.dump_minutes_as_cell() is None
+    assert zs.last_dump == 1
 
 
 def test_zsh_fork(zs):
