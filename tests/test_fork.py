@@ -1,5 +1,7 @@
+import os
 import sys
 import time
+import types
 
 import pytest
 
@@ -72,3 +74,41 @@ def test_fork_shell_quoting(sh):
         assert "double 'single'" in f.stdout
     finally:
         f.close()
+
+
+def test_fork_timeout_cleans_up_forkdir(sh, monkeypatch):
+    """If the FIFOs never connect within the wait window, fork() must still
+    remove the temp directory it created -- the except-Exception branch
+    above it already did this; the separate `_opened.wait(10)` timeout
+    branch used to skip it entirely, leaking a directory on every such
+    failure."""
+    import quahog.session as session_mod
+
+    class FakeResult:
+        text = "12345\n"
+
+    monkeypatch.setattr(sh, "run", lambda *a, **kw: FakeResult())
+
+    real_init = session_mod.ForkHandle.__init__
+
+    def patched_init(self, *a, **kw):
+        real_init(self, *a, **kw)
+        self._opened = types.SimpleNamespace(wait=lambda timeout=None: False)
+
+    monkeypatch.setattr(session_mod.ForkHandle, "__init__", patched_init)
+
+    created = {}
+    real_mkdtemp = session_mod.tempfile.mkdtemp
+
+    def spy_mkdtemp(*a, **kw):
+        path = real_mkdtemp(*a, **kw)
+        created["path"] = path
+        return path
+
+    monkeypatch.setattr(session_mod.tempfile, "mkdtemp", spy_mkdtemp)
+
+    with pytest.raises(RuntimeError, match="never connected"):
+        sh.fork("true")
+
+    assert "path" in created
+    assert not os.path.exists(created["path"])

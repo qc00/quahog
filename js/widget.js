@@ -130,7 +130,7 @@ function render({ model, el }) {
   });
   ro.observe(body);
 
-  model.on("msg:custom", (msg, buffers) => {
+  function onCustomMessage(msg, buffers) {
     if (msg.type === "out" && buffers && buffers.length) {
       const b = buffers[0];
       const u8 =
@@ -152,11 +152,13 @@ function render({ model, el }) {
       badge.style.display = msg.on ? "" : "none";
       camBtn.classList.toggle("qua-hot", !!msg.on);
     }
-  });
+  }
+  model.on("msg:custom", onCustomMessage);
 
-  model.on("change:session_name", () => {
+  function onSessionNameChange() {
     title.textContent = model.get("session_name");
-  });
+  }
+  model.on("change:session_name", onSessionNameChange);
 
   // Initial fit after layout settles, then ask the kernel for scrollback.
   requestAnimationFrame(() => {
@@ -167,6 +169,15 @@ function render({ model, el }) {
   });
 
   return () => {
+    // Without this, a render() invoked again for the same model (e.g. a
+    // reconnect/restart edge case where the previous view wasn't disposed
+    // first) leaves this listener alive alongside the new one: every future
+    // message -- including terminal-query output -- then gets processed
+    // twice, independently, by two Terminal instances that each auto-reply
+    // on the app's behalf (the mechanism behind PLAN.md §6's dedup, from a
+    // different angle than a single view retrying).
+    model.off("msg:custom", onCustomMessage);
+    model.off("change:session_name", onSessionNameChange);
     ro.disconnect();
     term.dispose();
   };

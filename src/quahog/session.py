@@ -11,11 +11,13 @@ from __future__ import annotations
 import codecs
 import datetime as _dt
 import os
+import re
 import shlex
 import shutil
 import signal
 import tempfile
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Union
@@ -178,9 +180,10 @@ class Session:
         # Every cell that displays this session gets its own live view
         # (PLAN.md §4): (ConsoleView, widget DisplayHandle, notes
         # DisplayHandle, captured parent header) tuples, all fanned the same
-        # output, any of them accepting input. The parent header lets a
+        # PTY output, any of them accepting input. The parent header lets a
         # screenshot fired long after the fact (toolbar click, no cell
-        # running) still land in the right cell — see _publish_note.
+        # running) land reliably in *that view's* cell only — see
+        # _publish_note_to.
         self._views: List[tuple] = []
         self._kernel = self._find_kernel()
         self.stdin = _Stdin(self)
@@ -205,6 +208,7 @@ class Session:
                 pass  # pyte missing or misbehaving: sessions still work
         self.altscreen = False
         self._iactive: List[tuple] = []  # (interceptor, ctx) for the running command
+        self._recent_input: List[tuple] = []  # (time, source, data) — see _is_duplicate_input
         if record:
             self._recorder.start(rows, cols)
 
@@ -571,7 +575,7 @@ class Session:
         output (PLAN.md §6). That output starts empty/invisible; this is what
         makes it appear at all, as its own distinct block rather than buried
         in the primary output's hidden text/plain fallback. Screenshots don't
-        go through here — see ``_publish_note``."""
+        go through here — see ``_publish_note_to``."""
         if not self._views:
             return
         transcript = self._transcript
@@ -683,16 +687,78 @@ class Session:
                 cast.close()
             raise
         if not handle._opened.wait(10):
+            # Same cleanup as the except branch above: the command ran (we
+            # got a pid) but never connected its FIFOs, so nobody else will
+            # ever remove this directory. The background thread blocked in
+            # os.open() on the stdin FIFO stays stuck regardless -- it's a
+            # daemon thread, so it dies with the process, but nothing short
+            # of a peer opening that FIFO unblocks it sooner.
+            shutil.rmtree(forkdir, ignore_errors=True)
+            if cast is not None:
+                cast.close()
             raise RuntimeError(f"fork streams never connected: {command!r}")
         return handle
 
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)
 
-    def _input(self, data: bytes, record: bool = True) -> None:
-        """Every user/programmatic keystroke funnels through here: recording
-        (with termios ECHO auto-suppression), interceptor on_input hooks,
-        then the PTY."""
+    _DEDUP_WINDOW = 0.15  # seconds
+
+    # Known terminal-reply shapes xterm.js auto-generates on the app's behalf:
+    # focus in/out, CPR (cursor position report), DA1/DA2 (device attributes),
+    # DECRPM (report mode), OSC 10/11/4 (color) replies. These are never
+    # something a human types — real key sequences (arrows, function keys)
+    # don't match — so it's safe to dedup them even from the *same* source,
+    # unlike a general escape-sequence dedup would be.
+    _TERMINAL_REPLY_RE = re.compile(
+        rb"^\x1b(?:"
+        rb"\[[OI]"
+        rb"|\[\d+;\d+R"
+        rb"|\[[>?]?\d*(?:;\d+)*c"
+        rb"|\[\??\d+;\d+\$y"
+        rb"|\](?:1[01]|4);[^\x07\x1b]*(?:\x07|\x1b\\)"
+        rb")$"
+    )
+
+    def _is_duplicate_input(self, data: bytes, source) -> bool:
+        """A full-screen app querying the terminal for its own capabilities
+        can retry if a reply doesn't arrive within its own short timeout —
+        plausible over the browser/kernel round trip a widget's input takes.
+        If replies then arrive for every attempt, the PTY receives the same
+        reply repeated, which some apps can't handle gracefully (observed:
+        vim's welcome screen replaced by a stray "y" — the tail of a DECRPM
+        reply landing three times in ~15ms, all from one attached view, no
+        stale views involved — ruling out cross-view duplication as the
+        cause). Concurrently-attached views (PLAN.md §4) compound the same
+        risk from a different angle: each independently answers the same
+        query, so N views means N replies to what should be one.
+
+        Recognized reply shapes are deduped within a short window regardless
+        of source; anything else only dedups across genuinely different
+        sources, since two distinct views sending identical bytes within a
+        couple hundred ms otherwise essentially never happens by coincidence
+        (a plain repeated character — e.g. two people coincidentally
+        pressing the same key in two cells — is content no reply ever takes,
+        so it's never touched either way)."""
+        now = time.monotonic()
+        self._recent_input = [(t, s, d) for t, s, d in self._recent_input if now - t < self._DEDUP_WINDOW]
+        is_reply = bool(self._TERMINAL_REPLY_RE.match(data))
+        if not is_reply and not data.startswith(b"\x1b"):
+            self._recent_input.append((now, source, data))
+            return False
+        for _t, s, d in self._recent_input:
+            if d == data and (is_reply or s is not source):
+                return True
+        self._recent_input.append((now, source, data))
+        return False
+
+    def _input(self, data: bytes, record: bool = True, source=None) -> None:
+        """Every user/programmatic keystroke funnels through here: dedup of
+        retried/cross-view terminal-capability replies, recording (with
+        termios ECHO auto-suppression), interceptor on_input hooks, then the
+        PTY."""
+        if self._is_duplicate_input(data, source):
+            return
         self._recorder.input(data, record=record, echoed=self._echo_on())
         for itc, ctx in list(self._iactive):
             fn = getattr(itc, "on_input", None)
@@ -799,19 +865,21 @@ class Session:
         return self._recorder.erase(count)
 
     def screenshot(self) -> Note:
-        """Dump the current screen as preformatted text, published as its own
-        brand-new output on every live view's cell — as if display() had
-        been called again — so each screenshot can be individually copied or
-        deleted rather than folded into one growing slot (works with no view
-        attached; returns the Note regardless)."""
+        """Dump the current screen as preformatted text; returns a Note.
+        Call this directly in a cell to have it appear there — the return
+        value auto-displays. The toolbar's camera button does *not* go
+        through here: it targets just the clicking view (see
+        ``_on_widget_msg``), so a screenshot never appears under a cell it
+        wasn't taken in, even if the same session is displayed elsewhere too."""
+        return Note(self._snapshot_text())
+
+    def _snapshot_text(self) -> str:
         if self._mirror is None:
             raise RuntimeError("screenshots need the 'pyte' package")
         with self._lock:
             text = self._mirror.snapshot()
         stamp = _dt.datetime.now().strftime("%H:%M:%S")
-        note_text = f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}"
-        self._publish_note(note_text)
-        return Note(note_text)
+        return f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}"
 
     def _on_rec_event(self, kind: str, **kw) -> None:
         if kind == "echo":
@@ -884,7 +952,20 @@ class Session:
 
         widget = ConsoleView(session_name=self.name)
         widget.on_msg(self._on_widget_msg)
+        comm = getattr(widget, "comm", None)
+        if comm is not None:
+            # Without this, a view whose frontend counterpart is gone (its
+            # cell was re-executed, its output cleared, ...) stays in
+            # _views forever: every future _emit/_refresh_* still tries to
+            # send to it (harmless, caught, but wasted work), and it's a
+            # standing extra "source" the input dedup has to reason about.
+            # A closed comm is the frontend's own signal that the view is
+            # actually gone -- this is not a guess about *why* it closed.
+            comm.on_close(lambda data, w=widget: self._prune_view(w))
         return widget
+
+    def _prune_view(self, widget) -> None:
+        self._views = [v for v in self._views if v[0] is not widget]
 
     def _on_widget_msg(self, widget, content, buffers) -> None:
         kind = content.get("type")
@@ -899,14 +980,14 @@ class Session:
                 self._send_to(widget, {"type": "exited", "code": self._returncode}, [])
         elif kind == "stdin":
             if not self._exited.is_set():
-                self._input(content.get("data", "").encode())
+                self._input(content.get("data", "").encode(), source=widget)
         elif kind == "pause":
             self.record(not self._recorder.recording)
         elif kind == "erase":
             self.erase()
         elif kind == "screenshot":
             try:
-                self.screenshot()
+                self._publish_note_to(widget, self._snapshot_text())
             except Exception:
                 pass
         elif kind == "resize":
@@ -929,14 +1010,16 @@ class Session:
         one for interceptor notes and the recording indicator — content that
         isn't literal PTY bytes, so it gets its own clearly separate block
         instead of being buried in the first output's hidden fallback text
-        (PLAN.md §6). Screenshots are different: each is published as a
-        brand-new output (like calling display() again, via ``_publish_note``)
-        so it can be individually copied or deleted, rather than folded into
-        one growing, only-as-a-whole-copyable slot — that's why this cell's
-        parent header is captured here and stashed per view: it lets a
-        screenshot triggered long afterward (toolbar click, no cell running)
-        still land reliably in *this* cell instead of whatever the kernel
-        happens to be processing when the click arrives."""
+        (PLAN.md §6). Screenshots are different again: a toolbar click on
+        *this* view publishes a brand-new output onto just *this* cell (like
+        calling display() again, via ``_publish_note_to``) — not every cell
+        that happens to display the session — so it can be individually
+        copied or deleted rather than folded into one shared slot. That's why
+        this cell's parent header is captured here and stashed per view: a
+        toolbar click is an async widget message, not a cell execution, so a
+        plain display() call at that point would land wherever the kernel
+        happens to be, which by the time a real click arrives is usually some
+        unrelated later cell."""
         from IPython.display import display
 
         widget = self._new_view()
@@ -957,19 +1040,30 @@ class Session:
             pass
         return None
 
-    def _publish_note(self, text: str) -> None:
-        """Publish ``text`` as a brand-new, separate output on every live
-        view's cell (PLAN.md §6) — as if ``display()`` were called again —
-        so each note (currently: screenshots) can be individually copied or
-        deleted, unlike content merged into one update_display_data-updated
-        slot. Attributed via each view's stashed parent header, so it lands
-        correctly even if other cells have run since, or the kernel is
-        otherwise idle when this fires."""
+    def _publish_note_to(self, widget, text: str) -> None:
+        """Publish ``text`` as a brand-new, separate output on just the ONE
+        cell that displays ``widget`` (PLAN.md §6) — as if ``display()`` were
+        called again — so a screenshot appears only where it was actually
+        taken, not on every cell that happens to display this session, and
+        can be individually copied or deleted rather than folded into one
+        growing update_display_data-updated slot.
+
+        Looks up ``widget``'s parent header, captured back when that cell's
+        ``_ipython_display_()`` ran — necessary because the toolbar click
+        that gets us here is an async widget message, not a cell execution,
+        so there's no "current cell" for a plain ``display()`` call to
+        attach to; it would land wherever the kernel happens to be, which by
+        the time a real click arrives is usually some unrelated later cell."""
+        header = None
+        for w, _handle, _notes, h in self._views:
+            if w is widget:
+                header = h
+                break
+        if header is None:
+            return
         mimebundle = Note(text)._repr_mimebundle_()
 
-        def _publish_one(header) -> None:
-            if header is None:
-                return
+        def _publish() -> None:
             try:
                 from IPython import get_ipython
 
@@ -982,15 +1076,11 @@ class Session:
             except Exception:
                 pass
 
-        def _update() -> None:
-            for _widget, _handle, _notes, header in list(self._views):
-                _publish_one(header)
-
         loop = getattr(self._kernel, "io_loop", None)
         if loop is not None:
-            loop.add_callback(_update)
+            loop.add_callback(_publish)
         else:
-            _update()
+            _publish()
 
     # ------------------------------------------------------------ integration
     def reinject(self, full: bool = False) -> None:

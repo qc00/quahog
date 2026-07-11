@@ -214,6 +214,15 @@ class EchoClassifier:
             self._timer.cancel()
             self._timer = None
 
+    def close(self) -> None:
+        """Cancel any pending expiry timer. Without this, a keystroke
+        classified right as the session closes leaves a ~WINDOW-second
+        daemon timer alive that fires into a closed recorder afterward —
+        harmless (the callback checks state) but needless."""
+        with self._lock:
+            self._pending = None
+            self._cancel()
+
 
 # ----------------------------------------------------------------- recorder
 class Recorder:
@@ -314,6 +323,12 @@ class Recorder:
         with self._lock:
             if self._writer is not None:
                 self._writer.close()
+            # Without this, `.recording` stays True forever after close
+            # (_writer is left non-None -- on purpose, so cast_path keeps
+            # working for post-mortem inspection -- so `recording` must be
+            # driven by _enabled instead).
+            self._enabled = False
+        self._classifier.close()
 
     # -- internal --------------------------------------------------------
     def _on_echo(self, cls: str) -> None:

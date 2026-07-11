@@ -7,7 +7,7 @@ import time
 import pytest
 
 import quahog
-from quahog.record import PLACEHOLDER, CastWriter, EchoClassifier, sidecar_dir
+from quahog.record import PLACEHOLDER, CastWriter, EchoClassifier, Recorder, sidecar_dir
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
 
@@ -208,3 +208,37 @@ def test_echo_classifier_three_way():
     c.input("\r")  # control keys are not classified
     c.output("noise")
     assert seen == ["verbatim", "masked", "none", "none"]
+
+
+def test_echo_classifier_close_cancels_pending_timer():
+    """A keystroke classified right as the session closes must not leave a
+    live daemon timer behind, firing into a closed recorder afterward."""
+    seen = []
+    c = EchoClassifier(seen.append)
+    c.input("a")  # arms the WINDOW-second expiry timer, no output yet
+    assert c._timer is not None
+    c.close()
+    assert c._timer is None
+    assert c._pending is None
+    time.sleep(EchoClassifier.WINDOW + 0.15)
+    assert seen == []  # the cancelled timer never fired
+
+
+def test_recorder_close_reflects_in_recording_state(tmp_path):
+    """`.recording` must go False once closed -- the writer object is kept
+    around on purpose (so cast_path still works for post-mortem inspection),
+    so `recording` has to be driven by the enabled flag, not by whether a
+    writer object merely exists."""
+    r = Recorder("s")
+    r.start(24, 80, path=tmp_path / "t.cast")
+    assert r.recording
+    r.close()
+    assert not r.recording
+    assert r.cast_path == tmp_path / "t.cast"  # still inspectable after close
+
+
+def test_recorder_close_is_idempotent(tmp_path):
+    r = Recorder("s")
+    r.start(24, 80, path=tmp_path / "t.cast")
+    r.close()
+    r.close()  # must not raise

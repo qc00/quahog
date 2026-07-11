@@ -1,11 +1,13 @@
 """Protocol-level verification of minuting against a real ipykernel.
 
-Frontends consume exactly three mechanisms:
+Frontends consume exactly four mechanisms:
   - update_display_data keeping each displaying cell's primary output (the
     widget + plain session text/plain, PLAN.md §5) in sync,
   - update_display_data keeping each displaying cell's second, initially
-    empty/invisible output (screenshots, interceptor notes, the recording
-    indicator — not literal PTY bytes, PLAN.md §6) in sync,
+    empty/invisible output (interceptor notes, the recording indicator —
+    not literal PTY bytes, PLAN.md §6) in sync,
+  - fresh display_data messages, one per screenshot, each attributed to
+    whichever *one* cell's view was actually clicked/called (PLAN.md §6),
   - execute_reply payloads with source=set_next_input creating %qua cells.
 These tests assert on those wire messages via jupyter_client — stronger than a
 pixel test, and it is the same surface VS Code consumes.
@@ -148,45 +150,78 @@ def test_screenshot_second_output_wire_protocol(kernel):
     assert len(notes) == 1, f"expected exactly one second (notes) output, got: {displays!r}"
     # Invisible until something is actually noted.
     assert notes[0]["content"]["data"].get("text/plain", "") == ""
-    # h stays open -- test_screenshot_separate_output_wire_protocol reuses it.
+    # h stays open -- test_screenshot_direct_call_wire_protocol reuses it.
 
 
-def test_screenshot_separate_output_wire_protocol(kernel):
-    """Each screenshot is published as its own brand-new output (PLAN.md §6)
-    — as if display() were called again — not merged into a single updated
-    slot, so each one can be individually copied or deleted. Attribution to
-    the right cell must survive an unrelated cell running in between, since a
-    real screenshot is usually triggered by a toolbar click at an arbitrary
-    later time, not synchronously from the anchor cell itself."""
+def test_screenshot_direct_call_wire_protocol(kernel):
+    """h.screenshot() called directly in a cell is just a returned Note: it
+    auto-displays as that cell's own execute_result, and — unlike the
+    toolbar's camera button — does not get published onto any *other* cell
+    that happens to display the same session (PLAN.md §6)."""
     kc = kernel
 
     reply, iopub = execute(kc, "h._ipython_display_()", settle=0.5)
-    anchor_id = reply["parent_header"]["msg_id"]
-    assert len(_live_displays(_displays(iopub))) == 1
+    other_id = reply["parent_header"]["msg_id"]
+
+    reply, iopub = execute(kc, "h.screenshot()", settle=0.5)
+    results = [m for m in iopub if m["msg_type"] == "execute_result"]
+    assert results, "screenshot()'s return value did not auto-display"
+    assert "[screen" in results[0]["content"]["data"].get("text/plain", "")
+
+    stray = [
+        m
+        for m in _displays(iopub)
+        if not m["content"].get("transient", {}).get("display_id")
+        and m["parent_header"].get("msg_id") == other_id
+    ]
+    assert not stray, f"screenshot() leaked into another cell's output: {stray!r}"
+
+
+def test_screenshot_toolbar_click_wire_protocol(kernel):
+    """A toolbar click (simulated the way the frontend actually triggers it:
+    a widget message carrying the specific view that was clicked) publishes
+    the screenshot only onto that *one* view's cell — not every cell
+    displaying the session, and each click is its own new, separate output
+    rather than an update to a shared slot (PLAN.md §6)."""
+    kc = kernel
+
+    reply1, iopub1 = execute(kc, "h._ipython_display_()", settle=0.5)
+    id1 = reply1["parent_header"]["msg_id"]
+    reply2, iopub2 = execute(kc, "h._ipython_display_()", settle=0.5)
+    id2 = reply2["parent_header"]["msg_id"]
+    assert id1 != id2
 
     execute(kc, "1 + 1")  # shifts the kernel's ambient "current" context
 
-    # screenshot() fans out to every live view (PLAN.md §4 convention) -- this
-    # shared kernel already has other views from earlier tests in this file,
-    # so filter to messages attributed to *this* anchor specifically.
-    def _new_outputs_for_anchor(iopub):
-        return [
-            m
-            for m in _displays(iopub)
-            if not m["content"].get("transient", {}).get("display_id")
-            and m["parent_header"].get("msg_id") == anchor_id
-        ]
+    def _new_outputs(iopub):
+        return [m for m in _displays(iopub) if not m["content"].get("transient", {}).get("display_id")]
 
-    _, iopub1 = execute(kc, "h.screenshot()", settle=1.0)
-    shots1 = _new_outputs_for_anchor(iopub1)
-    assert len(shots1) == 1, f"expected exactly one new output for this anchor, got: {shots1!r}"
-    assert "[screen" in shots1[0]["content"]["data"].get("text/plain", "")
+    # Click on the SECOND view specifically.
+    _, iopub = execute(
+        kc,
+        "widget2 = h._views[-1][0]\n"
+        "h._on_widget_msg(widget2, {'type': 'screenshot'}, [])\n"
+        "import time; time.sleep(0.5)\n",
+        settle=1.0,
+    )
+    news = _new_outputs(iopub)
+    assert len(news) == 1, f"expected exactly one new output, got: {news!r}"
+    assert news[0]["parent_header"]["msg_id"] == id2, "screenshot landed on the wrong (unclicked) cell"
+    assert news[0]["parent_header"]["msg_id"] != id1
+    assert "[screen" in news[0]["content"]["data"].get("text/plain", "")
+    first_click_id = news[0]["header"]["msg_id"]
 
-    _, iopub2 = execute(kc, "h.screenshot()", settle=1.0)
-    shots2 = _new_outputs_for_anchor(iopub2)
-    assert len(shots2) == 1
-    assert shots2[0]["header"]["msg_id"] != shots1[0]["header"]["msg_id"], (
-        "two screenshots must be two distinct output messages, not the same one repeated"
+    # Clicking again produces a second, distinct output on the same view.
+    _, iopub = execute(
+        kc,
+        "h._on_widget_msg(widget2, {'type': 'screenshot'}, [])\nimport time; time.sleep(0.5)\n",
+        settle=1.0,
+    )
+    news2 = _new_outputs(iopub)
+    assert len(news2) == 1
+    assert news2[0]["parent_header"]["msg_id"] == id2
+    assert news2[0]["header"]["msg_id"] != first_click_id, (
+        "two clicks must be two distinct output messages, not the same one repeated"
     )
     # h stays open -- test_concurrent_displays_wire_protocol reuses it.
 

@@ -109,6 +109,59 @@ def test_registry_and_default():
         quahog.sessions.pop(s.name, None)
 
 
+def test_duplicate_terminal_reply_is_dropped(sh, monkeypatch):
+    """A recognized terminal-capability reply (CPR, DA2, DECRPM, OSC color,
+    focus report -- never something a human types) is deduped within a short
+    window regardless of source, including repeats from the very same view:
+    a full-screen app can retry its own query if a reply doesn't arrive in
+    time (plausible over the browser/kernel round trip), and if replies then
+    show up for every attempt the PTY gets the same answer repeated, which
+    some apps can't handle (regression: vim's welcome screen replaced by a
+    stray "y" -- the tail of a DECRPM reply landing three times in ~15ms,
+    all from a single attached view)."""
+    writes = []
+    monkeypatch.setattr(sh, "_write", lambda data: writes.append(data))
+
+    class FakeView:
+        pass
+
+    a, b = FakeView(), FakeView()
+
+    sh._input(b"\x1b[?12;2$y", source=a)
+    sh._input(b"\x1b[?12;2$y", source=b)  # same reply, different view: dropped
+    sh._input(b"\x1b[?12;2$y", source=a)  # same view retrying: also dropped
+    assert writes == [b"\x1b[?12;2$y"]
+
+
+def test_duplicate_non_reply_escape_from_different_view_is_dropped(sh, monkeypatch):
+    """An unrecognized escape sequence (e.g. an arrow key) repeated
+    byte-for-byte from a genuinely different view within the window is still
+    treated as suspect and dropped -- but a repeat from the *same* view is a
+    real keystroke (someone holding an arrow key) and must go through every
+    time, not just once."""
+    writes = []
+    monkeypatch.setattr(sh, "_write", lambda data: writes.append(data))
+
+    class FakeView:
+        pass
+
+    a, b = FakeView(), FakeView()
+
+    sh._input(b"\x1b[A", source=a)
+    sh._input(b"\x1b[A", source=b)  # same bytes, different view: dropped
+    assert writes == [b"\x1b[A"]
+
+    sh._input(b"\x1b[A", source=a)  # same view repeating: a real repeat, not deduped
+    assert writes == [b"\x1b[A", b"\x1b[A"]
+
+    # Scoped to escape sequences: a plain repeated character (e.g. two
+    # people coincidentally pressing the same key in two cells) is never
+    # affected, even across views.
+    sh._input(b"a", source=a)
+    sh._input(b"a", source=b)
+    assert writes[-2:] == [b"a", b"a"]
+
+
 def test_reinject_after_exec(sh):
     sh.sendline("exec bash --norc")
     import time

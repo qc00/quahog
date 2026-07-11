@@ -4,10 +4,19 @@ Every PTY byte is fed through a pyte screen so ``Session.screenshot()`` works
 even with no view attached, and the alt-screen switch (CSI ?1049/?1047/?47)
 is tracked to mark full-screen interactive apps: while it is active run()
 refuses, minuting pauses, and the widget shows a badge.
+
+pyte's base ``Screen`` doesn't itself implement the alternate-screen buffer
+swap that a real terminal does for private mode 1049/1047/47 — it just keeps
+drawing into the one buffer regardless. Left alone, that means a screenshot
+taken after quitting a full-screen app (``less``, ``vim``) shows whatever
+that app last drew, not the shell prompt underneath. ``ScreenMirror`` does
+the swap itself: entering alt-screen stashes the current buffer and clears
+it for the app to draw on; leaving restores exactly what was stashed.
 """
 
 from __future__ import annotations
 
+import copy
 import re
 from typing import Optional
 
@@ -28,6 +37,8 @@ class ScreenMirror:
         self._stream = pyte.ByteStream(self._screen)
         self._carry = b""
         self.altscreen = False
+        self._saved_buffer = None
+        self._saved_cursor = None
 
     def feed(self, data: bytes) -> Optional[bool]:
         """Ingest PTY output; returns the new alt-screen state if it changed."""
@@ -42,8 +53,25 @@ class ScreenMirror:
             state = m.group(1) == b"h"
         if state != self.altscreen:
             self.altscreen = state
+            self._swap_buffer(state)
             return state
         return None
+
+    def _swap_buffer(self, entering_altscreen: bool) -> None:
+        try:
+            if entering_altscreen:
+                self._saved_buffer = copy.deepcopy(self._screen.buffer)
+                self._saved_cursor = copy.copy(self._screen.cursor)
+                self._screen.buffer.clear()
+                self._screen.cursor_position()
+            elif self._saved_buffer is not None:
+                self._screen.buffer.clear()
+                self._screen.buffer.update(self._saved_buffer)
+                self._screen.cursor = self._saved_cursor
+                self._saved_buffer = None
+                self._saved_cursor = None
+        except Exception:
+            pass  # a mirror hiccup must never kill the tap
 
     def resize(self, rows: int, cols: int) -> None:
         try:

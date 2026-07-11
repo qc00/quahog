@@ -107,6 +107,26 @@ def test_transcript_updates(ip, sh):
     assert "into-transcript" in widget._text
 
 
+def test_stale_view_pruned_when_comm_closes(ip, sh):
+    """A view whose frontend counterpart is gone (its cell was re-executed,
+    its output cleared, ...) must not stay in Session._views forever --
+    otherwise it keeps fanning PTY output to a dead comm indefinitely, and
+    is a standing extra input source. The frontend signals this itself via
+    comm_close; nothing here guesses at *why* the view went away."""
+    sh._ipython_display_()
+    sh._ipython_display_()
+    assert len(sh._views) == 2
+    first_widget = sh._views[0][0]
+    second_widget = sh._views[1][0]
+
+    first_widget.comm.handle_close({})
+    assert len(sh._views) == 1
+    assert sh._views[0][0] is second_widget
+
+    second_widget.comm.handle_close({})
+    assert len(sh._views) == 0
+
+
 def test_run_refuses_during_interactive(sh):
     sh.sendline("sleep 0.6")
     time.sleep(0.3)  # C marker fired, D not yet
