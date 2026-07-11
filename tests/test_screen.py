@@ -65,16 +65,17 @@ def test_mirror_altscreen_split_across_reads():
 # ---------------------------------------------------------------- session
 
 
-def test_screenshot_into_transcript(sh):
-    from quahog.minutes import Transcript, Note
+def test_screenshot_returns_note(sh):
+    """screenshot() itself is now published as its own new output on every
+    live view (PLAN.md §6, verified at the wire-protocol level in
+    test_kernel_protocol.py); at the unit level, just check its content."""
+    from quahog.minutes import Note
 
-    sh._transcript = Transcript(sh.name)
     sh.run("echo on-the-screen")
     assert _wait(lambda: "on-the-screen" in sh._mirror.snapshot())
     note = sh.screenshot()
     assert isinstance(note, Note)
     assert "on-the-screen" in note.text
-    assert note in sh._transcript.blocks
 
 
 def test_altscreen_blocks_run(sh):

@@ -176,11 +176,21 @@ class Session:
         self._returncode: Optional[int] = None
         self.cwd: Optional[str] = cwd
         # Every cell that displays this session gets its own live view
-        # (PLAN.md §4): (ConsoleView, DisplayHandle) pairs, all fanned the
-        # same output, any of them accepting input.
+        # (PLAN.md §4): (ConsoleView, widget DisplayHandle, notes
+        # DisplayHandle, captured parent header) tuples, all fanned the same
+        # output, any of them accepting input. The parent header lets a
+        # screenshot fired long after the fact (toolbar click, no cell
+        # running) still land in the right cell — see _publish_note.
         self._views: List[tuple] = []
         self._kernel = self._find_kernel()
         self.stdin = _Stdin(self)
+
+        # Non-literal console-log blocks: screenshots, interceptor notes,
+        # the recording indicator (PLAN.md §6) — shown as every live view's
+        # own second output, separate from the plain session-text output
+        # (created before the recorder so its "state" callback, which can
+        # fire synchronously below, always has somewhere to write).
+        self._transcript = Transcript(name)
 
         # Recording & hygiene (PLAN.md §6). The recorder exists even when not
         # recording so the toolbar and interceptors always have a target; the
@@ -208,10 +218,6 @@ class Session:
         self._icap: Optional[CommandResult] = None
         self._icap_marks: Optional[tuple] = None  # (raw_start, text_start)
         self._typed_cmd: Optional[str] = None
-        # Non-literal console-log blocks: screenshots, interceptor notes
-        # (PLAN.md §6) — merged into every live view's text, not displayed
-        # separately.
-        self._transcript = Transcript(name)
 
         # Session-lifetime streams. `raw` is the decoded data stream with
         # markers stripped but escapes kept; `text` is its cleaned form,
@@ -393,7 +399,8 @@ class Session:
             return  # typed while input suppression was active: never minuted
         for note in result.notes:
             # Not literal PTY bytes (an interceptor's vim diff etc.), so it
-            # doesn't already appear in self.text — surface it separately.
+            # doesn't already appear in self.text — surface it on the
+            # separate notes output instead (PLAN.md §6).
             self._transcript.append(Note(note))
         if self.minuting:
             self.minutes.append(
@@ -406,6 +413,8 @@ class Session:
                 )
             )
         self._refresh_views()
+        if result.notes:
+            self._refresh_notes()
 
     # ----------------------------------------------------------- interceptors
     def _istart(self, result: CommandResult) -> None:
@@ -534,37 +543,43 @@ class Session:
         except Exception:
             pass
 
-    def _console_text(self) -> str:
-        """The single-output console log (PLAN.md §1): clean session text
-        plus any non-literal blocks (screenshots, interceptor notes) — what a
-        non-widget renderer (git diff, nbconvert, an LLM) sees for this cell."""
-        parts = []
-        cast = self._recorder.cast_path
-        if cast is not None:
-            try:
-                rel = os.path.relpath(cast)
-            except ValueError:
-                rel = str(cast)
-            parts.append(f"[recording: {rel}]")
-        body = self.text
-        if body:
-            parts.append(body)
-        extra = self._transcript._plain()
-        if extra:
-            parts.append(extra)
-        return "\n\n".join(parts)
-
     def _refresh_views(self) -> None:
-        """Push the current console text to every live view's single output."""
+        """Push the current session text to every live view's primary output
+        (PLAN.md §1): plain, literal console text — what a non-widget
+        renderer (git diff, nbconvert, an LLM) sees for this cell."""
         if not self._views:
             return
-        text = self._console_text()
+        text = self.text
 
         def _update() -> None:
-            for widget, handle in list(self._views):
+            for widget, handle, _notes, _header in list(self._views):
                 try:
                     widget._text = text
                     handle.update(widget)
+                except Exception:
+                    pass
+
+        loop = getattr(self._kernel, "io_loop", None)
+        if loop is not None:
+            loop.add_callback(_update)
+        else:
+            _update()
+
+    def _refresh_notes(self) -> None:
+        """Push the current notes (interceptor output, the recording
+        indicator — not literal PTY bytes) to every live view's second
+        output (PLAN.md §6). That output starts empty/invisible; this is what
+        makes it appear at all, as its own distinct block rather than buried
+        in the primary output's hidden text/plain fallback. Screenshots don't
+        go through here — see ``_publish_note``."""
+        if not self._views:
+            return
+        transcript = self._transcript
+
+        def _update() -> None:
+            for _widget, _handle, notes, _header in list(self._views):
+                try:
+                    notes.update(transcript)
                 except Exception:
                     pass
 
@@ -784,17 +799,19 @@ class Session:
         return self._recorder.erase(count)
 
     def screenshot(self) -> Note:
-        """Dump the current screen as preformatted text into the console log
-        (works with no view attached); returns the Note."""
+        """Dump the current screen as preformatted text, published as its own
+        brand-new output on every live view's cell — as if display() had
+        been called again — so each screenshot can be individually copied or
+        deleted rather than folded into one growing slot (works with no view
+        attached; returns the Note regardless)."""
         if self._mirror is None:
             raise RuntimeError("screenshots need the 'pyte' package")
         with self._lock:
             text = self._mirror.snapshot()
         stamp = _dt.datetime.now().strftime("%H:%M:%S")
-        note = Note(f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}")
-        self._transcript.append(note)
-        self._refresh_views()
-        return note
+        note_text = f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}"
+        self._publish_note(note_text)
+        return Note(note_text)
 
     def _on_rec_event(self, kind: str, **kw) -> None:
         if kind == "echo":
@@ -803,7 +820,15 @@ class Session:
             self._emit({"type": "echo", "cls": kw.get("cls")}, [])
         elif kind == "state":
             self._emit_rec_state()
-            self._refresh_views()  # the "[recording: ...]" header changed
+            cast = self._recorder.cast_path
+            if cast is not None:
+                try:
+                    self._transcript.cast = os.path.relpath(cast)
+                except ValueError:
+                    self._transcript.cast = str(cast)
+            else:
+                self._transcript.cast = None
+            self._refresh_notes()  # the "[recording: ...]" line changed
 
     def _emit_rec_state(self, widget=None) -> None:
         p = self._recorder.cast_path
@@ -851,7 +876,7 @@ class Session:
             _send()
 
     def _emit(self, content: dict, buffers: list) -> None:
-        for widget, _ in list(self._views):
+        for widget, _handle, _notes, _header in list(self._views):
             self._send_to(widget, content, buffers)
 
     def _new_view(self):
@@ -896,15 +921,76 @@ class Session:
         """Embed a live console here. Every cell that displays the session
         gets its own live, independent view (PLAN.md §4) — output fans out to
         all of them, input from any of them goes to the one PTY, like
-        multiple clients attached to the same tmux session. The cell's single
-        output carries both the live widget and the current console log as
-        text/plain, kept in sync via update_display_data."""
+        multiple clients attached to the same tmux session.
+
+        Each display starts with two outputs, both kept in sync via
+        update_display_data: the live widget (its text/plain fallback is the
+        plain session console text), and a second, initially empty/invisible
+        one for interceptor notes and the recording indicator — content that
+        isn't literal PTY bytes, so it gets its own clearly separate block
+        instead of being buried in the first output's hidden fallback text
+        (PLAN.md §6). Screenshots are different: each is published as a
+        brand-new output (like calling display() again, via ``_publish_note``)
+        so it can be individually copied or deleted, rather than folded into
+        one growing, only-as-a-whole-copyable slot — that's why this cell's
+        parent header is captured here and stashed per view: it lets a
+        screenshot triggered long afterward (toolbar click, no cell running)
+        still land reliably in *this* cell instead of whatever the kernel
+        happens to be processing when the click arrives."""
         from IPython.display import display
 
         widget = self._new_view()
-        widget._text = self._console_text()
+        widget._text = self.text
         handle = display(widget, display_id=True)
-        self._views.append((widget, handle))
+        notes = display(self._transcript, display_id=True)
+        self._views.append((widget, handle, notes, self._capture_parent_header()))
+
+    @staticmethod
+    def _capture_parent_header() -> Optional[dict]:
+        try:
+            from IPython import get_ipython
+
+            ip = get_ipython()
+            if ip is not None:
+                return dict(ip.display_pub.parent_header)
+        except Exception:
+            pass
+        return None
+
+    def _publish_note(self, text: str) -> None:
+        """Publish ``text`` as a brand-new, separate output on every live
+        view's cell (PLAN.md §6) — as if ``display()`` were called again —
+        so each note (currently: screenshots) can be individually copied or
+        deleted, unlike content merged into one update_display_data-updated
+        slot. Attributed via each view's stashed parent header, so it lands
+        correctly even if other cells have run since, or the kernel is
+        otherwise idle when this fires."""
+        mimebundle = Note(text)._repr_mimebundle_()
+
+        def _publish_one(header) -> None:
+            if header is None:
+                return
+            try:
+                from IPython import get_ipython
+
+                kernel = getattr(get_ipython(), "kernel", None)
+                if kernel is None:
+                    return
+                content = {"data": mimebundle, "metadata": {}, "transient": {}}
+                msg = kernel.session.msg("display_data", content, parent=header)
+                kernel.session.send(kernel.iopub_socket, msg, ident=b"display_data")
+            except Exception:
+                pass
+
+        def _update() -> None:
+            for _widget, _handle, _notes, header in list(self._views):
+                _publish_one(header)
+
+        loop = getattr(self._kernel, "io_loop", None)
+        if loop is not None:
+            loop.add_callback(_update)
+        else:
+            _update()
 
     # ------------------------------------------------------------ integration
     def reinject(self, full: bool = False) -> None:

@@ -1,8 +1,11 @@
 """Protocol-level verification of minuting against a real ipykernel.
 
-Frontends consume exactly two mechanisms (PLAN.md §5):
-  - update_display_data messages keeping each displaying cell's single
-    output (widget view + text/plain console log) in sync,
+Frontends consume exactly three mechanisms:
+  - update_display_data keeping each displaying cell's primary output (the
+    widget + plain session text/plain, PLAN.md §5) in sync,
+  - update_display_data keeping each displaying cell's second, initially
+    empty/invisible output (screenshots, interceptor notes, the recording
+    indicator — not literal PTY bytes, PLAN.md §6) in sync,
   - execute_reply payloads with source=set_next_input creating %qua cells.
 These tests assert on those wire messages via jupyter_client — stronger than a
 pixel test, and it is the same surface VS Code consumes.
@@ -61,12 +64,23 @@ def _displays(iopub, msg_type="display_data"):
 
 
 def _live_displays(displays):
-    """display_data messages that are a console cell's single output: the
+    """display_data messages that are a console cell's primary output: the
     widget-view mimetype plus a transient display_id (PLAN.md §4)."""
     return [
         m
         for m in displays
         if "application/vnd.jupyter.widget-view+json" in m["content"]["data"]
+        and m["content"].get("transient", {}).get("display_id")
+    ]
+
+
+def _notes_displays(displays):
+    """display_data messages that are a console cell's *second* output: a
+    transient display_id, but no widget-view mimetype (PLAN.md §6)."""
+    return [
+        m
+        for m in displays
+        if "application/vnd.jupyter.widget-view+json" not in m["content"]["data"]
         and m["content"].get("transient", {}).get("display_id")
     ]
 
@@ -115,6 +129,66 @@ def test_minuting_wire_protocol(kernel):
     reply, _ = execute(kc, "h.dump_minutes_as_cell()")
     payloads = reply["content"].get("payload", [])
     assert not [p for p in payloads if p.get("source") == "set_next_input"]
+
+
+def test_screenshot_second_output_wire_protocol(kernel):
+    """A display starts with two outputs — the primary widget, and a second,
+    initially empty/invisible one for interceptor notes and the recording
+    indicator (PLAN.md §6). An earlier revision merged screenshots into that
+    same second slot too, silently breaking their "add a new, individually
+    copyable/deletable output" behavior: nothing was visibly wrong (the slot
+    still updated), so it went unnoticed until manual testing."""
+    kc = kernel
+
+    _, iopub = execute(kc, "h._ipython_display_()", settle=0.5)
+    displays = _displays(iopub)
+    anchors = _live_displays(displays)
+    notes = _notes_displays(displays)
+    assert len(anchors) == 1
+    assert len(notes) == 1, f"expected exactly one second (notes) output, got: {displays!r}"
+    # Invisible until something is actually noted.
+    assert notes[0]["content"]["data"].get("text/plain", "") == ""
+    # h stays open -- test_screenshot_separate_output_wire_protocol reuses it.
+
+
+def test_screenshot_separate_output_wire_protocol(kernel):
+    """Each screenshot is published as its own brand-new output (PLAN.md §6)
+    — as if display() were called again — not merged into a single updated
+    slot, so each one can be individually copied or deleted. Attribution to
+    the right cell must survive an unrelated cell running in between, since a
+    real screenshot is usually triggered by a toolbar click at an arbitrary
+    later time, not synchronously from the anchor cell itself."""
+    kc = kernel
+
+    reply, iopub = execute(kc, "h._ipython_display_()", settle=0.5)
+    anchor_id = reply["parent_header"]["msg_id"]
+    assert len(_live_displays(_displays(iopub))) == 1
+
+    execute(kc, "1 + 1")  # shifts the kernel's ambient "current" context
+
+    # screenshot() fans out to every live view (PLAN.md §4 convention) -- this
+    # shared kernel already has other views from earlier tests in this file,
+    # so filter to messages attributed to *this* anchor specifically.
+    def _new_outputs_for_anchor(iopub):
+        return [
+            m
+            for m in _displays(iopub)
+            if not m["content"].get("transient", {}).get("display_id")
+            and m["parent_header"].get("msg_id") == anchor_id
+        ]
+
+    _, iopub1 = execute(kc, "h.screenshot()", settle=1.0)
+    shots1 = _new_outputs_for_anchor(iopub1)
+    assert len(shots1) == 1, f"expected exactly one new output for this anchor, got: {shots1!r}"
+    assert "[screen" in shots1[0]["content"]["data"].get("text/plain", "")
+
+    _, iopub2 = execute(kc, "h.screenshot()", settle=1.0)
+    shots2 = _new_outputs_for_anchor(iopub2)
+    assert len(shots2) == 1
+    assert shots2[0]["header"]["msg_id"] != shots1[0]["header"]["msg_id"], (
+        "two screenshots must be two distinct output messages, not the same one repeated"
+    )
+    # h stays open -- test_concurrent_displays_wire_protocol reuses it.
 
 
 def test_concurrent_displays_wire_protocol(kernel):

@@ -96,11 +96,11 @@ def test_interactive_after_fork_not_filtered(sh):
 
 
 def test_transcript_updates(ip, sh):
-    """Every cell that displays the session is a live view whose single
+    """Every cell that displays the session is a live view whose primary
     output's text/plain is kept in sync as interactive commands complete
-    (PLAN.md §4/§5) — no separate transcript display."""
+    (PLAN.md §4/§5)."""
     sh._ipython_display_()
-    widget, _handle = sh._views[-1]
+    widget, _handle, _notes, _header = sh._views[-1]
     sh.sendline("echo into-transcript")
     _wait_minutes(sh)
     time.sleep(0.2)
