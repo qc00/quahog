@@ -167,13 +167,18 @@ class Session:
         self._rows, self._cols = rows, cols
         self._parser = StreamParser()
         self._ring = _Ring()
-        self._lock = threading.Lock()
+        # Reentrant: _refresh_views() reads self.text (lock-acquiring) from
+        # code paths that already hold the lock (_on_token, _on_exit).
+        self._lock = threading.RLock()
         self._active: Optional[CommandResult] = None
         self._at_prompt = threading.Event()
         self._exited = threading.Event()
         self._returncode: Optional[int] = None
         self.cwd: Optional[str] = cwd
-        self._widget = None
+        # Every cell that displays this session gets its own live view
+        # (PLAN.md §4): (ConsoleView, DisplayHandle) pairs, all fanned the
+        # same output, any of them accepting input.
+        self._views: List[tuple] = []
         self._kernel = self._find_kernel()
         self.stdin = _Stdin(self)
 
@@ -203,8 +208,10 @@ class Session:
         self._icap: Optional[CommandResult] = None
         self._icap_marks: Optional[tuple] = None  # (raw_start, text_start)
         self._typed_cmd: Optional[str] = None
-        self._transcript: Optional[Transcript] = None
-        self._thandle = None
+        # Non-literal console-log blocks: screenshots, interceptor notes
+        # (PLAN.md §6) — merged into every live view's text, not displayed
+        # separately.
+        self._transcript = Transcript(name)
 
         # Session-lifetime streams. `raw` is the decoded data stream with
         # markers stripped but escapes kept; `text` is its cleaned form,
@@ -250,6 +257,19 @@ class Session:
                     alt = self._mirror.feed(data)
                     if alt is not None:
                         self.altscreen = alt
+                        if not alt:
+                            # Leaving a full-screen app: its cursor-addressed
+                            # screen updates were excluded from the clean-text
+                            # log while active (clean_text() strips escape
+                            # sequences but has no notion of 2D cursor
+                            # positioning, so naively "cleaning" a TUI's
+                            # output produces unreadable run-on garbage, not
+                            # readable text) — leave a marker instead of
+                            # silently jumping. h.screenshot() is the tool for
+                            # "what was on screen" (PLAN.md §6).
+                            marker = "[full-screen app exited — see h.screenshot()]\n"
+                            self._text_parts.append(marker)
+                            self._text_len += len(marker)
                 for tok in self._parser.feed(data):
                     self._on_token(tok)
             self._recorder.output(data)
@@ -290,7 +310,8 @@ class Session:
 
     def _on_token(self, tok) -> None:
         if tok[0] == "data":
-            self._ingest(tok[1])
+            if not self.altscreen:
+                self._ingest(tok[1])
             target = self._active if self._active is not None else self._icap
             if target is not None and target._capturing:
                 target._buf += tok[1]
@@ -335,6 +356,7 @@ class Session:
                     self._typed_cmd = None
                     self._ifinish(active)
                     active._finish(rc)
+                    self._refresh_views()
                 elif self._icap is not None:
                     self._close_icap(rc)
             elif code in ("A", "B"):
@@ -369,10 +391,10 @@ class Session:
             return  # quahog's own plumbing (reinject, fork helper) isn't minuted
         if getattr(result, "_qs_suppressed", False):
             return  # typed while input suppression was active: never minuted
-        transcript = self._transcript
-        if transcript is not None:
-            transcript.append(result)
-            self._update_transcript()
+        for note in result.notes:
+            # Not literal PTY bytes (an interceptor's vim diff etc.), so it
+            # doesn't already appear in self.text — surface it separately.
+            self._transcript.append(Note(note))
         if self.minuting:
             self.minutes.append(
                 Minute(
@@ -383,6 +405,7 @@ class Session:
                     returncode=result.returncode,
                 )
             )
+        self._refresh_views()
 
     # ----------------------------------------------------------- interceptors
     def _istart(self, result: CommandResult) -> None:
@@ -511,16 +534,39 @@ class Session:
         except Exception:
             pass
 
-    def _update_transcript(self) -> None:
-        handle, transcript = self._thandle, self._transcript
-        if handle is None or transcript is None:
+    def _console_text(self) -> str:
+        """The single-output console log (PLAN.md §1): clean session text
+        plus any non-literal blocks (screenshots, interceptor notes) — what a
+        non-widget renderer (git diff, nbconvert, an LLM) sees for this cell."""
+        parts = []
+        cast = self._recorder.cast_path
+        if cast is not None:
+            try:
+                rel = os.path.relpath(cast)
+            except ValueError:
+                rel = str(cast)
+            parts.append(f"[recording: {rel}]")
+        body = self.text
+        if body:
+            parts.append(body)
+        extra = self._transcript._plain()
+        if extra:
+            parts.append(extra)
+        return "\n\n".join(parts)
+
+    def _refresh_views(self) -> None:
+        """Push the current console text to every live view's single output."""
+        if not self._views:
             return
+        text = self._console_text()
 
         def _update() -> None:
-            try:
-                handle.update(transcript)
-            except Exception:
-                pass
+            for widget, handle in list(self._views):
+                try:
+                    widget._text = text
+                    handle.update(widget)
+                except Exception:
+                    pass
 
         loop = getattr(self._kernel, "io_loop", None)
         if loop is not None:
@@ -544,6 +590,7 @@ class Session:
                 self._ifinish(active)
         if active is not None:
             active._finish(self._returncode)
+            self._refresh_views()
         self._exited.set()
         self._at_prompt.set()  # unblock anyone waiting on a dead shell
         self._recorder.close()
@@ -737,17 +784,16 @@ class Session:
         return self._recorder.erase(count)
 
     def screenshot(self) -> Note:
-        """Dump the current screen as preformatted text into the anchor cell's
-        transcript (works with no view attached); returns the Note."""
+        """Dump the current screen as preformatted text into the console log
+        (works with no view attached); returns the Note."""
         if self._mirror is None:
             raise RuntimeError("screenshots need the 'pyte' package")
         with self._lock:
             text = self._mirror.snapshot()
         stamp = _dt.datetime.now().strftime("%H:%M:%S")
         note = Note(f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}")
-        if self._transcript is not None:
-            self._transcript.append(note)
-            self._update_transcript()
+        self._transcript.append(note)
+        self._refresh_views()
         return note
 
     def _on_rec_event(self, kind: str, **kw) -> None:
@@ -757,18 +803,20 @@ class Session:
             self._emit({"type": "echo", "cls": kw.get("cls")}, [])
         elif kind == "state":
             self._emit_rec_state()
+            self._refresh_views()  # the "[recording: ...]" header changed
 
-    def _emit_rec_state(self) -> None:
+    def _emit_rec_state(self, widget=None) -> None:
         p = self._recorder.cast_path
-        self._emit(
-            {
-                "type": "rec-state",
-                "started": p is not None,
-                "recording": self._recorder.recording,
-                "cast": str(p) if p is not None else "",
-            },
-            [],
-        )
+        content = {
+            "type": "rec-state",
+            "started": p is not None,
+            "recording": self._recorder.recording,
+            "cast": str(p) if p is not None else "",
+        }
+        if widget is not None:
+            self._send_to(widget, content, [])
+        else:
+            self._emit(content, [])
 
     def close(self) -> None:
         self.terminate()
@@ -803,29 +851,27 @@ class Session:
             _send()
 
     def _emit(self, content: dict, buffers: list) -> None:
-        self._send_to(self._widget, content, buffers)
+        for widget, _ in list(self._views):
+            self._send_to(widget, content, buffers)
 
-    def _view(self):
+    def _new_view(self):
         from .widget import ConsoleView
 
-        if self._widget is None:
-            self._widget = ConsoleView(session_name=self.name)
-            self._widget.on_msg(self._on_widget_msg)
-        return self._widget
+        widget = ConsoleView(session_name=self.name)
+        widget.on_msg(self._on_widget_msg)
+        return widget
 
     def _on_widget_msg(self, widget, content, buffers) -> None:
-        if widget is not self._widget:
-            return  # a hopped-away (frozen) view; ignore its messages
         kind = content.get("type")
         if kind == "ready":
             scrollback = self._ring.dump()
             if scrollback:
-                self._emit({"type": "out"}, [scrollback])
-            self._emit_rec_state()
+                self._send_to(widget, {"type": "out"}, [scrollback])
+            self._emit_rec_state(widget)
             if self.altscreen:
-                self._emit({"type": "altscreen", "on": True}, [])
+                self._send_to(widget, {"type": "altscreen", "on": True}, [])
             if self._exited.is_set():
-                self._emit({"type": "exited", "code": self._returncode}, [])
+                self._send_to(widget, {"type": "exited", "code": self._returncode}, [])
         elif kind == "stdin":
             if not self._exited.is_set():
                 self._input(content.get("data", "").encode())
@@ -847,25 +893,18 @@ class Session:
                     pass
 
     def _ipython_display_(self) -> None:
-        """Embed the live console here. If it was displayed elsewhere before,
-        this is a hop (PLAN.md §4): the old embedded view freezes into a
-        static snapshot and this cell becomes the anchor — new transcript
-        lines and the live view both target it."""
+        """Embed a live console here. Every cell that displays the session
+        gets its own live, independent view (PLAN.md §4) — output fans out to
+        all of them, input from any of them goes to the one PTY, like
+        multiple clients attached to the same tmux session. The cell's single
+        output carries both the live widget and the current console log as
+        text/plain, kept in sync via update_display_data."""
         from IPython.display import display
 
-        old = self._widget
-        if old is not None:
-            self._send_to(old, {"type": "freeze"}, [])
-            self._widget = None
-        display(self._view())
-        self._transcript = Transcript(self.name)
-        cast = self._recorder.cast_path
-        if cast is not None:
-            try:
-                self._transcript.cast = os.path.relpath(cast)
-            except ValueError:
-                self._transcript.cast = str(cast)
-        self._thandle = display(self._transcript, display_id=True)
+        widget = self._new_view()
+        widget._text = self._console_text()
+        handle = display(widget, display_id=True)
+        self._views.append((widget, handle))
 
     # ------------------------------------------------------------ integration
     def reinject(self, full: bool = False) -> None:

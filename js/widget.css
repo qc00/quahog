@@ -37,18 +37,31 @@
 .qua-tools {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
 }
 
 .qua-btn {
+  display: flex;
+  align-items: center;
+  gap: 3px;
   background: none;
   border: none;
   margin: 0;
-  padding: 2px 3px;
+  padding: 2px 5px;
   color: #9aa0ae;
   border-radius: 4px;
   cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+}
+
+.qua-btn-icon {
+  display: inline-flex;
   line-height: 0;
+}
+
+.qua-btn-label {
+  white-space: nowrap;
 }
 
 .qua-btn:hover:not(:disabled) {
@@ -102,24 +115,4 @@
 
 .qua-body .xterm {
   height: 100%;
-}
-
-.qua-frozen {
-  resize: none;
-  height: auto;
-  max-height: 340px;
-  opacity: 0.85;
-}
-
-.qua-frozen .qua-body {
-  overflow: auto;
-  padding: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px;
-  color: #c8ccd4;
-  background: #16161e;
-}
-
-.qua-frozen .qua-body pre {
-  margin: 0;
 }

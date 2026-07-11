@@ -74,10 +74,9 @@ def test_password_prompt_regex():
 
 def test_custom_interceptor_registration(sh):
     """A registered interceptor's before/after hooks fire around a matched
-    interactive command, and after()'s return lands in the result's notes
-    (which the transcript block then renders)."""
-    from quahog.minutes import Transcript
-
+    interactive command, and after()'s return lands in the session's
+    console-log transcript as a Note (PLAN.md §6) — it isn't literal PTY
+    output, so it wouldn't otherwise appear anywhere."""
     calls = []
 
     class Spy:
@@ -93,7 +92,6 @@ def test_custom_interceptor_registration(sh):
 
     spy = Spy()
     interceptors.register(spy)
-    sh._transcript = Transcript(sh.name)
     try:
         sh.sendline("true")
         assert _wait(lambda: len(sh.minutes) >= 1)
@@ -101,8 +99,7 @@ def test_custom_interceptor_registration(sh):
         assert ("before", "true") in calls
         assert ("after", "true") in calls
         block = sh._transcript.blocks[-1]
-        assert "spy-note" in block.notes
-        assert "spy-note" in block._plain()
+        assert block._plain() == "spy-note"
     finally:
         interceptors.all_interceptors().remove(spy)
 

@@ -94,3 +94,24 @@ def test_screenshot_without_pyte_errors(sh, monkeypatch):
     monkeypatch.setattr(sh, "_mirror", None)
     with pytest.raises(RuntimeError, match="pyte"):
         sh.screenshot()
+
+
+def test_altscreen_output_excluded_from_text(sh):
+    """A full-screen app's cursor-addressed screen updates must not be fed
+    to clean_text(): it has no notion of 2D positioning, so "cleaning" them
+    produces unreadable run-on garbage rather than readable text (this is
+    what happened before the fix — a vim session showed up as ~2000 chars of
+    mashed-together status-bar/tilde/help text in the console log). Excluded
+    content is replaced by a marker; h.screenshot() covers "what was on
+    screen"."""
+    before = sh.text
+    sh.sendline("vim")
+    assert _wait(lambda: sh.altscreen is True)
+    sh.sendline(":q!")
+    assert _wait(lambda: sh.altscreen is False)
+    added = sh.text[len(before) :]
+    assert "[full-screen app exited" in added
+    # None of vim's actual screen content (status line, tildes, help text)
+    # leaked into the log.
+    assert "VIM - Vi IMproved" not in added
+    assert "~" * 5 not in added

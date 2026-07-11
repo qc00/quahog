@@ -1,7 +1,8 @@
 """Protocol-level verification of minuting against a real ipykernel.
 
 Frontends consume exactly two mechanisms (PLAN.md §5):
-  - update_display_data messages carrying the anchor-cell transcript,
+  - update_display_data messages keeping each displaying cell's single
+    output (widget view + text/plain console log) in sync,
   - execute_reply payloads with source=set_next_input creating %qua cells.
 These tests assert on those wire messages via jupyter_client — stronger than a
 pixel test, and it is the same surface VS Code consumes.
@@ -59,25 +60,30 @@ def _displays(iopub, msg_type="display_data"):
     return [m for m in iopub if m["msg_type"] == msg_type]
 
 
+def _live_displays(displays):
+    """display_data messages that are a console cell's single output: the
+    widget-view mimetype plus a transient display_id (PLAN.md §4)."""
+    return [
+        m
+        for m in displays
+        if "application/vnd.jupyter.widget-view+json" in m["content"]["data"]
+        and m["content"].get("transient", {}).get("display_id")
+    ]
+
+
 def test_minuting_wire_protocol(kernel):
     kc = kernel
-    # Anchor display: widget view + transcript display (with display_id).
+    # A session display is a single output: the live widget and the console
+    # log's text/plain together, under one display_id.
     _, iopub = execute(
         kc,
         "import quahog as q\n" "h = q.bash(inherit_rc=False)\n" "h._ipython_display_()\n",
         settle=0.5,
     )
-    displays = _displays(iopub)
-    widget_views = [m for m in displays if "application/vnd.jupyter.widget-view+json" in m["content"]["data"]]
-    transcripts = [
-        m
-        for m in displays
-        if m["content"].get("transient", {}).get("display_id")
-        and "application/vnd.jupyter.widget-view+json" not in m["content"]["data"]
-    ]
-    assert widget_views, "console widget view was not displayed"
-    assert transcripts, "transcript display (with display_id) was not emitted"
-    display_id = transcripts[-1]["content"]["transient"]["display_id"]
+    anchors = _live_displays(_displays(iopub))
+    assert len(anchors) == 1, f"expected exactly one display, got: {_displays(iopub)!r}"
+    assert "text/plain" in anchors[0]["content"]["data"]
+    display_id = anchors[0]["content"]["transient"]["display_id"]
 
     # Interactive command (sendline = same PTY path as typing in the widget).
     # No sleep inside the cell: the command must complete *between* executions,
@@ -89,9 +95,11 @@ def test_minuting_wire_protocol(kernel):
         for m in _displays(iopub, "update_display_data")
         if m["content"].get("transient", {}).get("display_id") == display_id
     ]
-    assert updates, "no update_display_data arrived for the transcript"
+    assert updates, "no update_display_data arrived for the console log"
     text = updates[-1]["content"]["data"].get("text/plain", "")
-    assert "$ echo minuted-live" in text
+    # The console log mirrors clean terminal text (PLAN.md §5), not a
+    # "$ cmd / [exit]" per-command block format.
+    assert "echo minuted-live" in text
     assert "minuted-live" in text
 
     # Explicit dump: the set_next_input payload rides the dumping cell's own
@@ -109,30 +117,33 @@ def test_minuting_wire_protocol(kernel):
     assert not [p for p in payloads if p.get("source") == "set_next_input"]
 
 
-def test_hop_new_transcript_wire_protocol(kernel):
+def test_concurrent_displays_wire_protocol(kernel):
+    """There is no hop: displaying the same session again opens a second,
+    independent live view rather than replacing the first, and a later
+    interactive command keeps *every* live view's output in sync (PLAN.md
+    §4) — the same fan-out the tap already does for pop-out views."""
     kc = kernel
-    # Hop: display again → fresh transcript display_id.
+
     _, iopub = execute(kc, "h._ipython_display_()", settle=0.5)
-    transcripts = [
-        m
-        for m in _displays(iopub)
-        if m["content"].get("transient", {}).get("display_id")
-        and "application/vnd.jupyter.widget-view+json" not in m["content"]["data"]
-    ]
-    assert transcripts, "hop did not emit a fresh transcript display"
-    new_id = transcripts[-1]["content"]["transient"]["display_id"]
+    anchors = _live_displays(_displays(iopub))
+    assert len(anchors) == 1
+    second_id = anchors[0]["content"]["transient"]["display_id"]
+
+    _, iopub = execute(kc, "h._ipython_display_()", settle=0.5)
+    anchors = _live_displays(_displays(iopub))
+    assert len(anchors) == 1
+    third_id = anchors[0]["content"]["transient"]["display_id"]
+    assert third_id != second_id, "each display() call should get its own live view"
 
     _, iopub = execute(
         kc,
-        "h.sendline('echo after-hop')\nimport time; time.sleep(1.2)\n",
+        "h.sendline('echo both-live')\nimport time; time.sleep(1.2)\n",
         settle=1.5,
     )
-    updates = [
-        m
-        for m in _displays(iopub, "update_display_data")
-        if m["content"].get("transient", {}).get("display_id") == new_id
-    ]
-    assert updates, "no transcript update for the hopped anchor"
-    text = updates[-1]["content"]["data"].get("text/plain", "")
-    assert "$ echo after-hop" in text, f"wrong transcript text: {text!r}"
+    updates = _displays(iopub, "update_display_data")
+    updated_ids = {m["content"].get("transient", {}).get("display_id") for m in updates}
+    assert {second_id, third_id} <= updated_ids, "not every live view was kept in sync"
+    for m in updates:
+        assert "both-live" in m["content"]["data"].get("text/plain", "")
+
     execute(kc, "h.close()")

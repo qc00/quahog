@@ -11,7 +11,10 @@ class ConsoleView(anywidget.AnyWidget):
     _css = _STATIC / "widget.css"
 
     session_name = traitlets.Unicode("").tag(sync=True)
-    # Hop support: when the session is displayed elsewhere, this view freezes
-    # into a static snapshot (SerializeAddon HTML) and stays that way.
-    frozen = traitlets.Bool(False).tag(sync=True)
-    frozen_html = traitlets.Unicode("").tag(sync=True)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._text = ""
+
+    def __repr__(self) -> str:
+        return self._text or f"<quahog console: {self.session_name}>"

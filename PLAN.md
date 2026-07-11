@@ -68,7 +68,7 @@ systemctl --user restart app
 
 | Concern | Library | Why |
 |---|---|---|
-| Terminal rendering | **xterm.js** + fit/serialize/webgl addons | Full TTY emulation; what JupyterLab's own terminal uses |
+| Terminal rendering | **xterm.js** + fit/webgl addons | Full TTY emulation; what JupyterLab's own terminal uses |
 | Widget plumbing | **anywidget** | Works in JupyterLab, Notebook 7, VS Code, Colab; binary buffers over comms |
 | Local PTY (unix) | **pexpect / ptyprocess** | PTY spawn, resize, termios access |
 | Local PTY (windows) | **pywinpty** (ConPTY) | Real TTY for cmd.exe, PowerShell, and `wsl.exe` |
@@ -144,10 +144,17 @@ step two
 
 ---
 
-## 4. The widget: embed, resize, pop-out, hop
+## 4. The widget: embed, resize, pop-out
 
 - **Embed:** anywidget view hosting xterm.js; kernel-side ring buffer (~2 MB) replays
   scrollback to newly attached views, so `display(h)` after a page reload reconnects.
+  Every cell that displays the session — `display(h)` — gets its own live, independent
+  view; there is no "anchor" or "hop": output fans out to all attached views, and input
+  from any of them merges into the one PTY, exactly like two clients attached to the
+  same tmux session (nothing technical prevents this — it's the same fan-out the tap
+  already does for pop-out views, below). Each cell's single output carries both the
+  live widget and the current console log as `text/plain` (§5), kept in sync via
+  `update_display_data`.
 - **Resize:** CSS `resize: both` + fit addon; view reports cols/rows → `setwinsize()`.
 - **Pop-out — no companion extension.** Three independent features, each a method *and* a
   toolbar button, freely combinable. The toolbar is our own HTML, so icons are a vendored SVG
@@ -165,22 +172,14 @@ step two
      (classic `/terminals/N` URLs still exist in jupyter-server, but its API can't specify the
      command a terminal runs, and Lab has no URL scheme that opens a terminal with a command —
      so we print the command for the user to paste rather than pretending to automate it).
-- **Concurrent displays are supported** — the tap already fans PTY output out to any number of
-  attached views, and input from all of them merges into the one PTY (like two clients attached
-  to the same tmux session). The only genuinely shared state is the PTY's single winsize: views
-  can't each have their own dimensions. Policy: **last resizer wins**; other views render at
-  the PTY's size (scroll/clip if their box is smaller) and show a subtle "N viewers · 120×32"
-  badge so a surprise resize is explicable. `h.resize(lock=True)` pins the size for demos.
-- **Hop** (embedded views only): `display(h)` in a new cell, or the widget's "hop here" button.
-  There is one live *embedded* view per session — hop is what moves it; the previous view
-  freezes itself via SerializeAddon into a static snapshot — cosmetic only, since that cell's
-  durable output is already the `CommandResult` text. Float/window/serve views are unaffected
-  by hopping.
-- **Screenshot:** a camera-icon toolbar button (always available, prominent in full-screen
-  mode) dumps the
-  current screen as preformatted text into the anchor cell's output (`display_data`,
-  `text/plain`); `h.screenshot()` does the same programmatically. Implemented kernel-side from
-  the pyte screen, so it works even with no view attached.
+- **Concurrent displays** — embedded, pop-out, or any mix — are all just views on the same
+  session. The only genuinely shared state is the PTY's single winsize: views can't each have
+  their own dimensions. Policy: **last resizer wins**; other views render at the PTY's size
+  (scroll/clip if their box is smaller). `h.resize(lock=True)` pins the size for demos.
+- **Screenshot:** a labeled toolbar button (always available, prominent in full-screen mode)
+  dumps the current screen as preformatted text into every live view's console log (§5);
+  `h.screenshot()` does the same programmatically. Implemented kernel-side from the pyte
+  screen, so it works even with no view attached.
 
 ---
 
@@ -199,11 +198,12 @@ Note: `set_next_input` rides on an `execute_reply` **payload**, so payloads writ
 executions never render, and when several are written in one execution **VS Code honors only
 the last**.
 
-- **Output stays in the anchor cell.** The cell that displayed the session holds a
-  *transcript* display handle; each interactive command's `{command, output, exit}` is appended
-  there as text via `update_display_data` (which frontends persist into the notebook).
-  After a hop, future transcript lines target
-  the new anchor cell — matching hop's contract that the old cell retains its era's history.
+- **Output stays in every cell that displayed the session.** A cell's single output already
+  carries the live widget-view mimetype *and* a `text/plain` console log (§4) — the session's
+  clean accumulated text plus any non-literal blocks (screenshots, interceptor notes). As
+  interactive commands complete, `text/plain` is refreshed via `update_display_data` for every
+  such cell (not just the most recent one), so a git diff, nbconvert, or an LLM reading the
+  `.ipynb` sees one readable output per display, no separate transcript block.
 - **`h.minutes` list** Every interactive command appends a
   `Minute` NamedTuple: `when` (timestamp), `command`, and `raw`/`text` **slice objects**
   indexing into the handle's session-lifetime streams `h.raw` and `h.text`, so `h.text[m.text]` is that command's output.

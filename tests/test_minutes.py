@@ -6,7 +6,6 @@ import pytest
 
 import quahog
 from quahog import LAST_DUMP, Minute
-from quahog.minutes import Transcript
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
 
@@ -96,21 +95,16 @@ def test_interactive_after_fork_not_filtered(sh):
     assert sh.minutes[0].command == "echo visible-again"
 
 
-def test_transcript_updates(sh):
-    updates = []
-
-    class FakeHandle:
-        def update(self, obj):
-            updates.append(obj)
-
-    sh._transcript = Transcript(sh.name)
-    sh._thandle = FakeHandle()
+def test_transcript_updates(ip, sh):
+    """Every cell that displays the session is a live view whose single
+    output's text/plain is kept in sync as interactive commands complete
+    (PLAN.md §4/§5) — no separate transcript display."""
+    sh._ipython_display_()
+    widget, _handle = sh._views[-1]
     sh.sendline("echo into-transcript")
     _wait_minutes(sh)
     time.sleep(0.2)
-    assert sh._transcript.blocks
-    assert "into-transcript" in repr(sh._transcript)
-    assert updates, "transcript display handle was not updated"
+    assert "into-transcript" in widget._text
 
 
 def test_run_refuses_during_interactive(sh):

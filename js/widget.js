@@ -43,43 +43,38 @@ function render({ model, el }) {
   root.appendChild(body);
   el.appendChild(root);
 
-  function showFrozen(html) {
-    root.classList.add("qua-frozen");
-    tools.style.display = "none";
-    body.innerHTML = html || "";
-    size.textContent = "hopped ⤵";
-  }
-
-  if (model.get("frozen")) {
-    showFrozen(model.get("frozen_html"));
-    return;
-  }
-
-  // Toolbar (PLAN.md §6): ⏸ pause and ⌫ erase are always present; the ⌫
-  // flashes when a keystroke goes un-echoed or masked (kernel-classified),
-  // ⏸ flashes on Enter — prompts to the user, never actions.
-  function mkbtn(name, tip, svg) {
+  // Toolbar (PLAN.md §6): the record toggle and ⌫ erase are always present,
+  // each labeled so the icon alone doesn't have to carry the meaning. ⌫
+  // flashes when a keystroke goes un-echoed or masked (kernel-classified);
+  // the record toggle flashes on Enter — prompts to the user, never actions.
+  function mkbtn(name, label, svg) {
     const b = document.createElement("button");
     b.className = "qua-btn qua-btn-" + name;
-    b.title = tip;
-    b.innerHTML = svg;
+    b.title = label;
+    const icon = document.createElement("span");
+    icon.className = "qua-btn-icon";
+    icon.innerHTML = svg;
+    const text = document.createElement("span");
+    text.className = "qua-btn-label";
+    text.textContent = label;
+    b.appendChild(icon);
+    b.appendChild(text);
     tools.appendChild(b);
     return b;
   }
   // One toggle for the whole recording lifecycle (start / pause / resume);
-  // its icon and tint are the sole recording-state indicator.
-  const recBtn = mkbtn("rec", "start recording", SVG.record);
-  const eraseBtn = mkbtn("erase", "erase previous keystroke(s) from the recording", SVG.erase);
-  const camBtn = mkbtn("camera", "screenshot into the notebook", SVG.camera);
+  // its icon, tint and label are the sole recording-state indicator.
+  const recBtn = mkbtn("rec", "Record", SVG.record);
+  const eraseBtn = mkbtn("erase", "Erase", SVG.erase);
+  const camBtn = mkbtn("camera", "Screenshot", SVG.camera);
+  const recLabel = recBtn.querySelector(".qua-btn-label");
 
   let recState = { started: false, recording: false };
   function renderRec() {
-    recBtn.innerHTML = recState.recording ? SVG.pause : SVG.record;
-    recBtn.title = !recState.started
-      ? "start recording"
-      : recState.recording
-        ? "pause recording"
-        : "resume recording";
+    recBtn.querySelector(".qua-btn-icon").innerHTML = recState.recording ? SVG.pause : SVG.record;
+    const label = !recState.started ? "Record" : recState.recording ? "Pause" : "Resume";
+    recLabel.textContent = label;
+    recBtn.title = label + " recording";
     recBtn.classList.toggle("qua-rec-on", recState.recording);
     // ⌫ only means something while recording (it edits the flush tail), so it
     // is genuinely disabled — no hover, no click — otherwise.
@@ -105,16 +100,13 @@ function render({ model, el }) {
     theme: { background: "#16161e", foreground: "#c8ccd4" },
   });
   const fit = new FitAddon();
-  const ser = new SerializeAddon();
   term.loadAddon(fit);
-  term.loadAddon(ser);
   term.open(body);
 
   let exited = false;
-  let frozen = false;
 
   term.onData((d) => {
-    if (exited || frozen) return;
+    if (exited) return;
     // Enter: flash the record toggle so the user confirms the recording state
     // (PLAN.md §6).
     if (recState.recording && d.includes("\r")) flash(recBtn);
@@ -122,7 +114,7 @@ function render({ model, el }) {
   });
   term.onResize(({ cols, rows }) => {
     size.textContent = `${cols}×${rows}`;
-    if (!frozen) model.send({ type: "resize", cols, rows });
+    model.send({ type: "resize", cols, rows });
   });
 
   let raf = 0;
@@ -138,31 +130,7 @@ function render({ model, el }) {
   });
   ro.observe(body);
 
-  function freeze() {
-    if (frozen) return;
-    frozen = true;
-    let html = "";
-    try {
-      html = ser.serializeAsHTML({ includeGlobalBackground: true });
-    } catch (e) {
-      try {
-        const pre = document.createElement("pre");
-        pre.textContent = ser.serialize();
-        html = pre.outerHTML;
-      } catch (e2) {
-        html = "";
-      }
-    }
-    model.set("frozen", true);
-    model.set("frozen_html", html);
-    model.save_changes();
-    ro.disconnect();
-    term.dispose();
-    showFrozen(html);
-  }
-
   model.on("msg:custom", (msg, buffers) => {
-    if (frozen) return;
     if (msg.type === "out" && buffers && buffers.length) {
       const b = buffers[0];
       const u8 =
@@ -174,8 +142,6 @@ function render({ model, el }) {
       exited = true;
       const code = msg.code === null || msg.code === undefined ? "?" : msg.code;
       term.write(`\r\n\x1b[2m[session exited: ${code}]\x1b[0m\r\n`);
-    } else if (msg.type === "freeze") {
-      freeze();
     } else if (msg.type === "rec-state") {
       recState = { started: !!msg.started, recording: !!msg.recording };
       renderRec();
@@ -202,7 +168,7 @@ function render({ model, el }) {
 
   return () => {
     ro.disconnect();
-    if (!frozen) term.dispose();
+    term.dispose();
   };
 }
 

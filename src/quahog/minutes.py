@@ -1,22 +1,23 @@
-"""Minuting support: the anchor-cell transcript.
+"""Minuting support: interactive-command capture and non-literal console notes.
 
-The cell that displayed a session holds a transcript display handle; every
-interactive command's {command, output, exit} is appended there as text via
-update_display_data, so the durable record never depends on cell creation.
-
-Cell creation itself is pull-based — Session.dump_minutes_as_cell() — after
-VS Code field testing (2026-07-11) showed set_next_input payloads written
-between executions never render, and only the last payload per execution is
-honored. See PLAN.md §5.
+Every cell that displays a session is a live, independent view (PLAN.md §4);
+its single output's ``text/plain`` is the session's clean console log —
+``Session.text`` plus any ``Transcript`` blocks (screenshots, interceptor
+notes: things that aren't literal PTY bytes) — kept in sync via
+``update_display_data``. Cell *creation* is a separate, explicit concern:
+``Session.dump_minutes_as_cell()``, pull-based after VS Code field testing
+(2026-07-11) showed ``set_next_input`` payloads written between executions
+never render, and only the last payload per execution is honored. See
+PLAN.md §5.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, List
 
 
 class Note:
-    """A plain-text block in the anchor transcript that isn't a command:
+    """A plain-text console-log block that isn't literal PTY output:
     screenshots, interceptor output (vim diffs), and the like."""
 
     def __init__(self, text: str) -> None:
@@ -33,25 +34,17 @@ class Note:
 
 
 class Transcript:
-    """Accumulated interactive commands for one anchor-cell era."""
+    """Accumulated non-literal console-log blocks for one session."""
 
     def __init__(self, session_name: str) -> None:
         self.session_name = session_name
         self.blocks: List[Any] = []  # anything with a _plain() method
-        # Set when the session records: the committed cell then references the
-        # .cast sidecar so replay tooling can find it (PLAN.md §6).
-        self.cast: Optional[str] = None
 
     def append(self, block: Any) -> None:
         self.blocks.append(block)
 
     def _plain(self) -> str:
-        lines = [f"[recording: {self.cast}]"] if self.cast else []
-        lines.extend(b._plain() for b in self.blocks)
-        return "\n".join(lines)
-
-    def _repr_mimebundle_(self, include=None, exclude=None):
-        return {"text/plain": self._plain()}
+        return "\n".join(b._plain() for b in self.blocks)
 
     def __repr__(self) -> str:
         return self._plain()
