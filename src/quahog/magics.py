@@ -36,9 +36,12 @@ def _resolve_session(name):
 
 @magics_class
 class QuahogMagics(Magics):
-    def _parse(self, line):
+    def _parse(self, line, positional_session=False):
         opts, arg = self.parse_options(line, "s:t:b", mode="string")
-        session = _resolve_session(opts.get("s"))
+        name = opts.get("s")
+        if positional_session and not name and arg.strip():
+            name = arg.strip().split()[0]
+        session = _resolve_session(name)
         timeout = float(opts["t"]) if "t" in opts else None
         wait = "b" not in opts
         return session, timeout, wait, arg
@@ -52,7 +55,8 @@ class QuahogMagics(Magics):
 
     @cell_magic("qua")
     def qua_cell(self, line, cell):
-        session, timeout, wait, _ = self._parse(line)
+        # ``%%qua prod`` — bare positional session name, as minuting emits it.
+        session, timeout, wait, _ = self._parse(line, positional_session=True)
         results = []
         for raw in cell.splitlines():
             command = raw.strip()

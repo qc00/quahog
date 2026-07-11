@@ -11,3 +11,7 @@ class ConsoleView(anywidget.AnyWidget):
     _css = _STATIC / "widget.css"
 
     session_name = traitlets.Unicode("").tag(sync=True)
+    # Hop support: when the session is displayed elsewhere, this view freezes
+    # into a static snapshot (SerializeAddon HTML) and stays that way.
+    frozen = traitlets.Bool(False).tag(sync=True)
+    frozen_html = traitlets.Unicode("").tag(sync=True)

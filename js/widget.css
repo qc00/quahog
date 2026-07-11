@@ -36,3 +36,23 @@
 .qua-body .xterm {
   height: 100%;
 }
+
+.qua-frozen {
+  resize: none;
+  height: auto;
+  max-height: 340px;
+  opacity: 0.85;
+}
+
+.qua-frozen .qua-body {
+  overflow: auto;
+  padding: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  color: #c8ccd4;
+  background: #16161e;
+}
+
+.qua-frozen .qua-body pre {
+  margin: 0;
+}

@@ -9,14 +9,17 @@ CommandResult text; the widget is a pure client-side view.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import tempfile
 import threading
 from collections import deque
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
+from .fork import ForkHandle
+from .minutes import Transcript
 from .osc import StreamParser
 from .result import CommandResult
 
@@ -120,10 +123,19 @@ class Session:
         self._exited = threading.Event()
         self._returncode: Optional[int] = None
         self.cwd: Optional[str] = cwd
-        self._views: list = []
         self._widget = None
         self._kernel = self._find_kernel()
         self.stdin = _Stdin(self)
+
+        # Minuting (PLAN.md §5): interactive commands are captured between the
+        # shell integration's C and D markers; the typed text arrives on the
+        # private OSC 5522;E channel.
+        self.minutes = True
+        self._icap: Optional[CommandResult] = None
+        self._typed_cmd: Optional[str] = None
+        self._minute_q: deque = deque()
+        self._transcript: Optional[Transcript] = None
+        self._thandle = None
 
         self._reader = threading.Thread(
             target=self._read_loop, name=f"quahog-{name}", daemon=True
@@ -162,9 +174,9 @@ class Session:
 
     def _on_token(self, tok) -> None:
         if tok[0] == "data":
-            active = self._active
-            if active is not None and active._capturing:
-                active._buf += tok[1]
+            target = self._active if self._active is not None else self._icap
+            if target is not None and target._capturing:
+                target._buf += tok[1]
             return
         _, num, payload = tok
         if num == "133":
@@ -172,19 +184,86 @@ class Session:
             if code == "C":
                 if self._active is not None:
                     self._active._capturing = True
+                else:
+                    # Interactively typed command: capture it the same way.
+                    # zsh's preexec delivered the text on 5522;E already; bash
+                    # delivers it in precmd, just before D.
+                    self._icap = CommandResult(self.name, self._typed_cmd or "")
+                    self._icap._capturing = True
+                    self._typed_cmd = None
             elif code == "D":
                 parts = payload.split(";")
                 rc = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
-                active, self._active = self._active, None
-                if active is not None:
+                if self._active is not None:
+                    active, self._active = self._active, None
+                    # The E marker fired for this run() command too; drop the
+                    # stash or the next *interactive* command inherits it.
+                    self._typed_cmd = None
                     active._finish(rc)
+                elif self._icap is not None:
+                    icap, self._icap = self._icap, None
+                    if not icap.command:
+                        icap.command = self._typed_cmd or ""
+                    self._typed_cmd = None
+                    icap._finish(rc)
+                    self._record_interactive(icap)
             elif code in ("A", "B"):
+                if code == "A" and self._icap is not None:
+                    # A fresh prompt while a capture is still open: the command
+                    # never produced a D (exec, exit into a nested shell, lost
+                    # integration). Close it out honestly.
+                    icap, self._icap = self._icap, None
+                    icap._finish(None)
+                    self._record_interactive(icap)
                 self._at_prompt.set()
+        elif num == "5522":
+            kind, _, rest = payload.partition(";")
+            if kind == "E":
+                if self._icap is not None and not self._icap.command:
+                    self._icap.command = rest.strip()
+                else:
+                    self._typed_cmd = rest.strip()
         elif num == "7" and payload.startswith("file://"):
             rest = payload[len("file://") :]
             slash = rest.find("/")
             if slash != -1:
                 self.cwd = rest[slash:]
+
+    def _record_interactive(self, result: CommandResult) -> None:
+        command = result.command.strip()
+        if not command:
+            return
+        if "__qua_" in command or str(_INJECT_DIR) in command:
+            return  # quahog's own plumbing (reinject, fork helper) isn't minuted
+        transcript = self._transcript
+        if transcript is not None:
+            transcript.append(result)
+            self._update_transcript()
+        if self.minutes:
+            self._minute_q.append(result)
+
+    def _drain_minutes(self) -> List[CommandResult]:
+        out = []
+        while self._minute_q:
+            out.append(self._minute_q.popleft())
+        return out
+
+    def _update_transcript(self) -> None:
+        handle, transcript = self._thandle, self._transcript
+        if handle is None or transcript is None:
+            return
+
+        def _update() -> None:
+            try:
+                handle.update(transcript)
+            except Exception:
+                pass
+
+        loop = getattr(self._kernel, "io_loop", None)
+        if loop is not None:
+            loop.add_callback(_update)
+        else:
+            _update()
 
     def _on_exit(self) -> None:
         try:
@@ -225,14 +304,44 @@ class Session:
                 raise RuntimeError(
                     f"session {self.name!r} is busy running: {self._active.command!r}"
                 )
+            if self._icap is not None:
+                raise RuntimeError(
+                    f"session {self.name!r} is busy with an interactive command: "
+                    f"{self._icap.command!r}"
+                )
             result = CommandResult(self.name, command)
             self._active = result
+            self._typed_cmd = None
             self._at_prompt.clear()
         self._write(command.encode() + b"\r")
         if wait:
             if not result._done.wait(timeout):
                 raise TimeoutExpired(result, timeout)
         return result
+
+    def fork(self, command: str, timeout: float = 15.0) -> ForkHandle:
+        """Run ``command`` with fresh std streams and its own handle.
+
+        The kernel creates a FIFO trio; the injected __qua_fork helper starts
+        ``sh -c command`` redirected onto it in the background, so the session
+        stays free and stdout/stderr are genuinely separate.
+        """
+        forkdir = tempfile.mkdtemp(prefix="quaf-")
+        for n in ("0", "1", "2"):
+            os.mkfifo(os.path.join(forkdir, n))
+        handle = ForkHandle(self.name, command, forkdir)
+        try:
+            r = self.run(
+                f"__qua_fork {shlex.quote(forkdir)} {shlex.quote(command)}",
+                timeout=timeout,
+            )
+            handle.pid = int(r.text.strip().splitlines()[-1])
+        except Exception:
+            shutil.rmtree(forkdir, ignore_errors=True)
+            raise
+        if not handle._opened.wait(10):
+            raise RuntimeError(f"fork streams never connected: {command!r}")
+        return handle
 
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)
@@ -297,8 +406,7 @@ class Session:
             shutil.rmtree(tmp, ignore_errors=True)
 
     # -------------------------------------------------------------- widgets
-    def _emit(self, content: dict, buffers: list) -> None:
-        widget = self._widget
+    def _send_to(self, widget, content: dict, buffers: list) -> None:
         if widget is None:
             return
 
@@ -314,6 +422,9 @@ class Session:
         else:
             _send()
 
+    def _emit(self, content: dict, buffers: list) -> None:
+        self._send_to(self._widget, content, buffers)
+
     def _view(self):
         from .widget import ConsoleView
 
@@ -323,6 +434,8 @@ class Session:
         return self._widget
 
     def _on_widget_msg(self, widget, content, buffers) -> None:
+        if widget is not self._widget:
+            return  # a hopped-away (frozen) view; ignore its messages
         kind = content.get("type")
         if kind == "ready":
             scrollback = self._ring.dump()
@@ -342,9 +455,19 @@ class Session:
                     pass
 
     def _ipython_display_(self) -> None:
+        """Embed the live console here. If it was displayed elsewhere before,
+        this is a hop (PLAN.md §4): the old embedded view freezes into a
+        static snapshot and this cell becomes the anchor — new transcript
+        lines and the live view both target it."""
         from IPython.display import display
 
+        old = self._widget
+        if old is not None:
+            self._send_to(old, {"type": "freeze"}, [])
+            self._widget = None
         display(self._view())
+        self._transcript = Transcript(self.name)
+        self._thandle = display(self._transcript, display_id=True)
 
     # ------------------------------------------------------------ integration
     def reinject(self, full: bool = False) -> None:
@@ -356,6 +479,14 @@ class Session:
         """
         path = _INJECT_DIR / ("zsh.zsh" if self.shell_kind == "zsh" else "posix.sh")
         if full:
+            # The snippet contains '![' character classes, which a shell with
+            # history expansion still enabled would mangle at read time — so
+            # disable it first, as its own line. The trailing marker comment
+            # keeps the guard line out of the minutes.
+            if self.shell_kind == "zsh":
+                self.sendline("setopt no_bang_hist # __qua_reinject")
+            else:
+                self.sendline("set +H # __qua_reinject")
             lines = [
                 ln
                 for ln in path.read_text().splitlines()
@@ -381,6 +512,10 @@ def _rcfile_bash(tmpdir: str, inherit_rc: bool) -> str:
     lines = []
     if inherit_rc:
         lines.append('[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"')
+    else:
+        # Isolated session: keep the in-memory history (minuting needs it) but
+        # never read or write the user's ~/.bash_history.
+        lines.append("HISTFILE=")
     lines.append(f". '{_INJECT_DIR / 'posix.sh'}'")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
