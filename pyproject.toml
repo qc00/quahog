@@ -7,7 +7,7 @@ name = "quahog"
 version = "0.4.0"
 description = "Interactive console sessions, captured in Jupyter notebooks"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "anywidget>=0.9",

@@ -100,7 +100,7 @@ def test_transcript_updates(ip, sh):
     output's text/plain is kept in sync as interactive commands complete
     (PLAN.md §4/§5)."""
     sh._ipython_display_()
-    widget, _handle, _notes, _header = sh._views[-1]
+    widget, _handle, _notes, _header = sh._state.views[-1]
     sh.sendline("echo into-transcript")
     _wait_minutes(sh)
     time.sleep(0.2)
@@ -115,16 +115,16 @@ def test_stale_view_pruned_when_comm_closes(ip, sh):
     comm_close; nothing here guesses at *why* the view went away."""
     sh._ipython_display_()
     sh._ipython_display_()
-    assert len(sh._views) == 2
-    first_widget = sh._views[0][0]
-    second_widget = sh._views[1][0]
+    assert len(sh._state.views) == 2
+    first_widget = sh._state.views[0][0]
+    second_widget = sh._state.views[1][0]
 
     first_widget.comm.handle_close({})
-    assert len(sh._views) == 1
-    assert sh._views[0][0] is second_widget
+    assert len(sh._state.views) == 1
+    assert sh._state.views[0][0] is second_widget
 
     second_widget.comm.handle_close({})
-    assert len(sh._views) == 0
+    assert len(sh._state.views) == 0
 
 
 def test_run_refuses_during_interactive(sh):

@@ -8,26 +8,22 @@ CommandResult text; the widget is a pure client-side view.
 
 from __future__ import annotations
 
-import codecs
 import datetime as _dt
 import os
-import re
 import shlex
 import shutil
 import signal
 import tempfile
 import threading
-import time
-from collections import deque
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Union
+from typing import Dict, NamedTuple, Optional, Union
 
 from . import interceptors as _interceptors
 from .fork import ForkHandle
 from .minutes import Note, Transcript
-from .osc import StreamParser
 from .record import Recorder
-from .result import CommandResult, clean_text
+from .result import CommandResult
+from .state import SessionState
 
 try:
     from .screen import ScreenMirror
@@ -73,24 +69,6 @@ class TimeoutExpired(TimeoutError):
     def __init__(self, result: CommandResult, timeout: float) -> None:
         super().__init__(f"command did not finish in {timeout}s (still running): " f"{result.command!r}")
         self.result = result
-
-
-class _Ring:
-    """Bounded scrollback of raw PTY bytes, replayed to newly attached views."""
-
-    def __init__(self, cap: int = 2_000_000) -> None:
-        self._chunks: deque = deque()
-        self._size = 0
-        self._cap = cap
-
-    def append(self, b: bytes) -> None:
-        self._chunks.append(b)
-        self._size += len(b)
-        while self._size > self._cap and self._chunks:
-            self._size -= len(self._chunks.popleft())
-
-    def dump(self) -> bytes:
-        return b"".join(self._chunks)
 
 
 class _Stdin:
@@ -167,78 +145,45 @@ class Session:
 
         self._proc = PtyProcess.spawn(list(argv), cwd=cwd, env=full_env, dimensions=(rows, cols))
         self._rows, self._cols = rows, cols
-        self._parser = StreamParser()
-        self._ring = _Ring()
-        # Reentrant: _refresh_views() reads self.text (lock-acquiring) from
-        # code paths that already hold the lock (_on_token, _on_exit).
-        self._lock = threading.RLock()
-        self._active: Optional[CommandResult] = None
         self._at_prompt = threading.Event()
         self._exited = threading.Event()
         self._returncode: Optional[int] = None
         self.cwd: Optional[str] = cwd
-        # Every cell that displays this session gets its own live view
-        # (PLAN.md §4): (ConsoleView, widget DisplayHandle, notes
-        # DisplayHandle, captured parent header) tuples, all fanned the same
-        # PTY output, any of them accepting input. The parent header lets a
-        # screenshot fired long after the fact (toolbar click, no cell
-        # running) land reliably in *that view's* cell only — see
-        # _publish_note_to.
-        self._views: List[tuple] = []
         self._kernel = self._find_kernel()
         self.stdin = _Stdin(self)
-
-        # Non-literal console-log blocks: screenshots, interceptor notes,
-        # the recording indicator (PLAN.md §6) — shown as every live view's
-        # own second output, separate from the plain session-text output
-        # (created before the recorder so its "state" callback, which can
-        # fire synchronously below, always has somewhere to write).
         self._transcript = Transcript(name)
 
         # Recording & hygiene (PLAN.md §6). The recorder exists even when not
-        # recording so the toolbar and interceptors always have a target; the
-        # mirror keeps kernel-side screen state for screenshots and tracks the
-        # alt-screen switch that marks full-screen apps.
+        # recording so the toolbar and interceptors always have a target.
         self._recorder = Recorder(name, on_event=self._on_rec_event)
-        self._mirror = None
+
+        # Minuting (PLAN.md §5): `minuting` gates appending; `last_dump` is the
+        # pull-based dump_minutes_as_cell cursor. Both are touched only from the
+        # kernel thread, so they live on the façade, not in the shared state.
+        self.minuting = True
+        self.last_dump = 0
+
+        # Every piece of state shared across the reader/kernel/worker threads —
+        # scrollback ring, pyte mirror, OSC parser, lifetime raw/text streams,
+        # the command FSM, minutes, the view registry, the input-dedup buffer —
+        # lives behind one lock in SessionState (PLAN.md §3). The mirror tracks
+        # the alt-screen switch that marks full-screen apps; it needs pyte,
+        # which may be absent (sessions still work, screenshots don't).
+        mirror = None
         if ScreenMirror is not None:
             try:
-                self._mirror = ScreenMirror(rows, cols)
+                mirror = ScreenMirror(rows, cols)
             except Exception:
                 pass  # pyte missing or misbehaving: sessions still work
-        self.altscreen = False
-        self._iactive: List[tuple] = []  # (interceptor, ctx) for the running command
-        self._recent_input: List[tuple] = []  # (time, source, data) — see _is_duplicate_input
+        self._state = SessionState(mirror=mirror)
         if record:
             self._recorder.start(rows, cols)
-
-        # Minuting (PLAN.md §5): interactive commands are captured between the
-        # shell integration's C and D markers; the typed text arrives on the
-        # private OSC 2607;QUA;E channel. Each one appends a Minute to `minutes`
-        # whose raw/text slices index the session-lifetime streams below.
-        self.minuting = True
-        self.minutes: List[Minute] = []
-        self.last_dump = 0
-        self._icap: Optional[CommandResult] = None
-        self._icap_marks: Optional[tuple] = None  # (raw_start, text_start)
-        self._typed_cmd: Optional[str] = None
-
-        # Session-lifetime streams. `raw` is the decoded data stream with
-        # markers stripped but escapes kept; `text` is its cleaned form,
-        # materialized up to the last command boundary (unbounded by design —
-        # they are what Minute slices point into).
-        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        self._raw_parts: List[str] = []
-        self._raw_len = 0
-        self._unflushed: List[str] = []
-        self._text_parts: List[str] = []
-        self._text_len = 0
 
         self._reader = threading.Thread(target=self._read_loop, name=f"quahog-{name}", daemon=True)
         self._reader.start()
         # Wait for the first prompt marker so run() right after construction
         # doesn't race shell startup.
-        self._at_prompt.wait(10)
+        self._at_prompt.wait(self._PROMPT_WAIT)
 
     # ------------------------------------------------------------------ tap
     @staticmethod
@@ -253,6 +198,7 @@ class Session:
 
     def _read_loop(self) -> None:
         fd = self._proc.fd
+        st = self._state
         while True:
             try:
                 data = os.read(fd, 65536)
@@ -260,27 +206,13 @@ class Session:
                 data = b""
             if not data:
                 break
-            alt = None
-            with self._lock:
-                self._ring.append(data)
-                if self._mirror is not None:
-                    alt = self._mirror.feed(data)
-                    if alt is not None:
-                        self.altscreen = alt
-                        if not alt:
-                            # Leaving a full-screen app: its cursor-addressed
-                            # screen updates were excluded from the clean-text
-                            # log while active (clean_text() strips escape
-                            # sequences but has no notion of 2D cursor
-                            # positioning, so naively "cleaning" a TUI's
-                            # output produces unreadable run-on garbage, not
-                            # readable text) — leave a marker instead of
-                            # silently jumping. h.screenshot() is the tool for
-                            # "what was on screen" (PLAN.md §6).
-                            marker = "[full-screen app exited — see h.screenshot()]\n"
-                            self._text_parts.append(marker)
-                            self._text_len += len(marker)
-                for tok in self._parser.feed(data):
+            # One critical section per read (PLAN.md §3): scrollback, mirror,
+            # parser and the command FSM move together; feed_screen() also
+            # markers the clean-text log when a full-screen app exits.
+            with st.lock:
+                st.append_output(data)
+                alt = st.feed_screen(data)
+                for tok in st.parser.feed(data):
                     self._on_token(tok)
             self._recorder.output(data)
             if alt is not None:
@@ -288,46 +220,30 @@ class Session:
             self._emit({"type": "out"}, [data])
         self._on_exit()
 
-    def _ingest(self, b: bytes) -> None:
-        s = self._decoder.decode(b)
-        if s:
-            self._raw_parts.append(s)
-            self._raw_len += len(s)
-            self._unflushed.append(s)
-
-    def _text_boundary(self) -> int:
-        """Materialize the clean-text stream up to 'now'; return its length.
-        Called at command boundaries (C/D), which sit at line edges, so
-        carriage-return overlays never straddle the flush point in practice."""
-        if self._unflushed:
-            cleaned = clean_text("".join(self._unflushed))
-            self._unflushed.clear()
-            self._text_parts.append(cleaned)
-            self._text_len += len(cleaned)
-        return self._text_len
-
     def _close_icap(self, rc: Optional[int]) -> None:
-        icap, self._icap = self._icap, None
-        marks, self._icap_marks = self._icap_marks, None
+        st = self._state
+        icap, st.icap = st.icap, None
+        marks, st.icap_marks = st.icap_marks, None
         if not icap.command:
-            icap.command = self._typed_cmd or ""
-        self._typed_cmd = None
+            icap.command = st.typed_cmd or ""
+        st.typed_cmd = None
         self._ifinish(icap)
         icap._finish(rc)
-        raw_s = slice(marks[0], self._raw_len) if marks else slice(0, 0)
-        text_s = slice(marks[1], self._text_boundary()) if marks else slice(0, 0)
+        raw_s = slice(marks[0], st.raw_len) if marks else slice(0, 0)
+        text_s = slice(marks[1], st.text_boundary()) if marks else slice(0, 0)
         self._record_interactive(icap, raw_s, text_s)
 
     def _on_token(self, tok) -> None:
+        st = self._state
         if tok[0] == "data":
-            if not self.altscreen:
-                self._ingest(tok[1])
-            target = self._active if self._active is not None else self._icap
+            if not st.altscreen:
+                st.ingest(tok[1])
+            target = st.active if st.active is not None else st.icap
             if target is not None and target._capturing:
                 target._buf += tok[1]
-            if self._iactive:
+            if st.iactive:
                 text = tok[1].decode("utf-8", "replace")
-                for itc, ctx in self._iactive:
+                for itc, ctx in st.iactive:
                     fn = getattr(itc, "on_output", None)
                     if fn is not None:
                         try:
@@ -339,38 +255,38 @@ class Session:
         if num == "133":
             code = payload[:1]
             if code == "C":
-                if self._active is not None:
-                    self._active._capturing = True
-                    self._istart(self._active)
+                if st.active is not None:
+                    st.active._capturing = True
+                    self._istart(st.active)
                 else:
                     # Interactively typed command: capture it the same way.
                     # Both shells deliver the text on 2607;QUA;E just before C
                     # (zsh from preexec; bash from the DEBUG trap); bash sends
                     # a history-accurate correction in precmd, before D.
-                    self._icap = CommandResult(self.name, self._typed_cmd or "")
-                    self._icap._capturing = True
+                    st.icap = CommandResult(self.name, st.typed_cmd or "")
+                    st.icap._capturing = True
                     if self._recorder.suppressed:
                         # Typed while input suppression is active (PLAN.md §5):
                         # likely a secret misread as a command — never minuted.
-                        self._icap._qs_suppressed = True
-                    self._icap_marks = (self._raw_len, self._text_boundary())
-                    self._typed_cmd = None
-                    self._istart(self._icap)
+                        st.icap._qs_suppressed = True
+                    st.icap_marks = (st.raw_len, st.text_boundary())
+                    st.typed_cmd = None
+                    self._istart(st.icap)
             elif code == "D":
                 parts = payload.split(";")
                 rc = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
-                if self._active is not None:
-                    active, self._active = self._active, None
+                if st.active is not None:
+                    active, st.active = st.active, None
                     # The E marker fired for this run() command too; drop the
                     # stash or the next *interactive* command inherits it.
-                    self._typed_cmd = None
+                    st.typed_cmd = None
                     self._ifinish(active)
                     active._finish(rc)
                     self._refresh_views()
-                elif self._icap is not None:
+                elif st.icap is not None:
                     self._close_icap(rc)
             elif code in ("A", "B"):
-                if code == "A" and self._icap is not None:
+                if code == "A" and st.icap is not None:
                     # A fresh prompt while a capture is still open: the command
                     # never produced a D (exec, exit into a nested shell, lost
                     # integration). Close it out honestly.
@@ -383,13 +299,13 @@ class Session:
             kind, _, rest = body.partition(";")
             if kind == "E":
                 cmd = rest.strip()
-                if self._icap is not None:
+                if st.icap is not None:
                     # bash's precmd E carries the history-accurate line; it
                     # supersedes the DEBUG-trap guess the capture opened with.
                     if cmd:
-                        self._icap.command = cmd
+                        st.icap.command = cmd
                 else:
-                    self._typed_cmd = cmd
+                    st.typed_cmd = cmd
             elif kind == "I":
                 self._on_handshake(rest)
         elif num == "7" and payload.startswith("file://"):
@@ -419,7 +335,7 @@ class Session:
             # separate notes output instead (PLAN.md §6).
             self._transcript.append(Note(note))
         if self.minuting:
-            self.minutes.append(
+            self._state.append_minute(
                 Minute(
                     when=_dt.datetime.now(),
                     command=command,
@@ -436,7 +352,7 @@ class Session:
     def _istart(self, result: CommandResult) -> None:
         """Match interceptors (PLAN.md §6) against the command that just
         started; run their before() hooks. Called at the OSC 133;C marker."""
-        self._iactive = []
+        self._state.iactive = []
         command = (result.command or "").strip()
         if not command or "__qua_" in command:
             return
@@ -454,14 +370,14 @@ class Session:
                 fn = getattr(itc, "before", None)
                 if fn is not None:
                     fn(ctx)
-                self._iactive.append((itc, ctx))
+                self._state.iactive.append((itc, ctx))
             except Exception:
                 pass
 
     def _ifinish(self, result: Optional[CommandResult]) -> None:
         """Command ended (OSC 133;D or forced close): run after() hooks,
         attach any returned text to the result, drop leaked suppressions."""
-        active, self._iactive = self._iactive, []
+        active, self._state.iactive = self._state.iactive, []
         for itc, ctx in active:
             out = None
             try:
@@ -478,16 +394,22 @@ class Session:
     def raw(self) -> str:
         """The session's data stream since start: escapes kept, markers
         stripped. Minute.raw slices index into this."""
-        with self._lock:
-            return "".join(self._raw_parts)
+        return self._state.raw()
 
     @property
     def text(self) -> str:
         """Clean-text form of ``raw``. Minute.text slices index into this."""
-        with self._lock:
-            done = "".join(self._text_parts)
-            tail = clean_text("".join(self._unflushed)) if self._unflushed else ""
-        return done + tail
+        return self._state.text()
+
+    @property
+    def altscreen(self) -> bool:
+        """Whether a full-screen app currently owns the alt-screen (PLAN.md §6)."""
+        return self._state.altscreen
+
+    @property
+    def minutes(self) -> list:
+        """Interactively typed commands, each a Minute (PLAN.md §5)."""
+        return self._state.minutes_snapshot()
 
     def dump_minutes_as_cell(
         self,
@@ -509,8 +431,7 @@ class Session:
         frontends honor only one payload per execution, so call this once per
         cell.
         """
-        with self._lock:
-            entries = list(self.minutes)
+        entries = self._state.minutes_snapshot()
 
         def _index(bound, default: int) -> int:
             if bound is None:
@@ -563,12 +484,13 @@ class Session:
         """Push the current session text to every live view's primary output
         (PLAN.md §1): plain, literal console text — what a non-widget
         renderer (git diff, nbconvert, an LLM) sees for this cell."""
-        if not self._views:
+        views = self._state.views_snapshot()
+        if not views:
             return
         text = self.text
 
         def _update() -> None:
-            for widget, handle, _notes, _header in list(self._views):
+            for widget, handle, _notes, _header in views:
                 try:
                     widget._text = text
                     handle.update(widget)
@@ -588,12 +510,13 @@ class Session:
         makes it appear at all, as its own distinct block rather than buried
         in the primary output's hidden text/plain fallback. Screenshots don't
         go through here — see ``_publish_note_to``."""
-        if not self._views:
+        views = self._state.views_snapshot()
+        if not views:
             return
         transcript = self._transcript
 
         def _update() -> None:
-            for _widget, _handle, notes, _header in list(self._views):
+            for _widget, _handle, notes, _header in views:
                 try:
                     notes.update(transcript)
                 except Exception:
@@ -613,9 +536,10 @@ class Session:
         self._returncode = self._proc.exitstatus
         if self._returncode is None and self._proc.signalstatus is not None:
             self._returncode = -self._proc.signalstatus
-        with self._lock:
-            active, self._active = self._active, None
-            if self._icap is not None:
+        st = self._state
+        with st.lock:
+            active, st.active = st.active, None
+            if st.icap is not None:
                 self._close_icap(self._returncode)
             elif active is not None:
                 self._ifinish(active)
@@ -648,16 +572,17 @@ class Session:
                 f"session {self.name!r} is inside a full-screen app (alt-screen); "
                 "run() is disabled — interact via the console or screenshot()"
             )
-        with self._lock:
-            if self._active is not None:
-                raise RuntimeError(f"session {self.name!r} is busy running: {self._active.command!r}")
-            if self._icap is not None:
+        st = self._state
+        with st.lock:
+            if st.active is not None:
+                raise RuntimeError(f"session {self.name!r} is busy running: {st.active.command!r}")
+            if st.icap is not None:
                 raise RuntimeError(
-                    f"session {self.name!r} is busy with an interactive command: " f"{self._icap.command!r}"
+                    f"session {self.name!r} is busy with an interactive command: " f"{st.icap.command!r}"
                 )
             result = CommandResult(self.name, command)
-            self._active = result
-            self._typed_cmd = None
+            st.active = result
+            st.typed_cmd = None
             self._at_prompt.clear()
         self._input(command.encode() + b"\r")
         if wait:
@@ -719,65 +644,15 @@ class Session:
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)
 
-    _DEDUP_WINDOW = 0.15  # seconds
-
-    # Known terminal-reply shapes xterm.js auto-generates on the app's behalf:
-    # focus in/out, CPR (cursor position report), DA1/DA2 (device attributes),
-    # DECRPM (report mode), OSC 10/11/4 (color) replies. These are never
-    # something a human types — real key sequences (arrows, function keys)
-    # don't match — so it's safe to dedup them even from the *same* source,
-    # unlike a general escape-sequence dedup would be.
-    _TERMINAL_REPLY_RE = re.compile(
-        rb"^\x1b(?:"
-        rb"\[[OI]"
-        rb"|\[\d+;\d+R"
-        rb"|\[[>?]?\d*(?:;\d+)*c"
-        rb"|\[\??\d+;\d+\$y"
-        rb"|\](?:1[01]|4);[^\x07\x1b]*(?:\x07|\x1b\\)"
-        rb")$"
-    )
-
-    def _is_duplicate_input(self, data: bytes, source) -> bool:
-        """A full-screen app querying the terminal for its own capabilities
-        can retry if a reply doesn't arrive within its own short timeout —
-        plausible over the browser/kernel round trip a widget's input takes.
-        If replies then arrive for every attempt, the PTY receives the same
-        reply repeated, which some apps can't handle gracefully (observed:
-        vim's welcome screen replaced by a stray "y" — the tail of a DECRPM
-        reply landing three times in ~15ms, all from one attached view, no
-        stale views involved — ruling out cross-view duplication as the
-        cause). Concurrently-attached views (PLAN.md §4) compound the same
-        risk from a different angle: each independently answers the same
-        query, so N views means N replies to what should be one.
-
-        Recognized reply shapes are deduped within a short window regardless
-        of source; anything else only dedups across genuinely different
-        sources, since two distinct views sending identical bytes within a
-        couple hundred ms otherwise essentially never happens by coincidence
-        (a plain repeated character — e.g. two people coincidentally
-        pressing the same key in two cells — is content no reply ever takes,
-        so it's never touched either way)."""
-        now = time.monotonic()
-        self._recent_input = [(t, s, d) for t, s, d in self._recent_input if now - t < self._DEDUP_WINDOW]
-        is_reply = bool(self._TERMINAL_REPLY_RE.match(data))
-        if not is_reply and not data.startswith(b"\x1b"):
-            self._recent_input.append((now, source, data))
-            return False
-        for _t, s, d in self._recent_input:
-            if d == data and (is_reply or s is not source):
-                return True
-        self._recent_input.append((now, source, data))
-        return False
-
     def _input(self, data: bytes, record: bool = True, source=None) -> None:
         """Every user/programmatic keystroke funnels through here: dedup of
-        retried/cross-view terminal-capability replies, recording (with
-        termios ECHO auto-suppression), interceptor on_input hooks, then the
-        PTY."""
-        if self._is_duplicate_input(data, source):
+        retried/cross-view terminal-capability replies (SessionState), recording
+        (with termios ECHO auto-suppression), interceptor on_input hooks, then
+        the PTY."""
+        if self._state.is_duplicate_input(data, source):
             return
         self._recorder.input(data, record=record, echoed=self._echo_on())
-        for itc, ctx in list(self._iactive):
+        for itc, ctx in self._state.iactive_snapshot():
             fn = getattr(itc, "on_input", None)
             if fn is not None:
                 try:
@@ -853,9 +728,7 @@ class Session:
         self._rows, self._cols = rows, cols
         self._proc.setwinsize(rows, cols)
         self._recorder.resize(rows, cols)
-        if self._mirror is not None:
-            with self._lock:
-                self._mirror.resize(rows, cols)
+        self._state.resize_screen(rows, cols)
 
     # ------------------------------------------------------- recording (§6)
     @property
@@ -891,10 +764,9 @@ class Session:
         return Note(self._snapshot_text())
 
     def _snapshot_text(self) -> str:
-        if self._mirror is None:
+        text = self._state.screen_snapshot()
+        if text is None:
             raise RuntimeError("screenshots need the 'pyte' package")
-        with self._lock:
-            text = self._mirror.snapshot()
         stamp = _dt.datetime.now().strftime("%H:%M:%S")
         return f"[screen {self.name} {stamp} {self._cols}×{self._rows}]\n{text}"
 
@@ -961,7 +833,7 @@ class Session:
             _send()
 
     def _emit(self, content: dict, buffers: list) -> None:
-        for widget, _handle, _notes, _header in list(self._views):
+        for widget, _handle, _notes, _header in self._state.views_snapshot():
             self._send_to(widget, content, buffers)
 
     def _new_view(self):
@@ -982,12 +854,12 @@ class Session:
         return widget
 
     def _prune_view(self, widget) -> None:
-        self._views = [v for v in self._views if v[0] is not widget]
+        self._state.prune_view(widget)
 
     def _on_widget_msg(self, widget, content, buffers) -> None:
         kind = content.get("type")
         if kind == "ready":
-            scrollback = self._ring.dump()
+            scrollback = self._state.dump_scrollback()
             if scrollback:
                 self._send_to(widget, {"type": "out"}, [scrollback])
             self._emit_rec_state(widget)
@@ -1043,7 +915,7 @@ class Session:
         widget._text = self.text
         handle = display(widget, display_id=True)
         notes = display(self._transcript, display_id=True)
-        self._views.append((widget, handle, notes, self._capture_parent_header()))
+        self._state.add_view((widget, handle, notes, self._capture_parent_header()))
 
     @staticmethod
     def _capture_parent_header() -> Optional[dict]:
@@ -1072,7 +944,7 @@ class Session:
         attach to; it would land wherever the kernel happens to be, which by
         the time a real click arrives is usually some unrelated later cell."""
         header = None
-        for w, _handle, _notes, h in self._views:
+        for w, _handle, _notes, h in self._state.views_snapshot():
             if w is widget:
                 header = h
                 break
@@ -1123,7 +995,7 @@ class Session:
             self.sendline(f". '{path}'")
 
     def __repr__(self) -> str:
-        state = f"exited {self._returncode}" if self._exited.is_set() else ("busy" if self._active else "at prompt")
+        state = f"exited {self._returncode}" if self._exited.is_set() else ("busy" if self._state.active else "at prompt")
         return f"<quahog.Session {self.name} ({self.shell_kind}, pid {self.pid}, {state})>"
 
 

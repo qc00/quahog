@@ -100,7 +100,7 @@ def test_screenshot_returns_note(sh):
     from quahog.minutes import Note
 
     sh.run("echo on-the-screen")
-    assert _wait(lambda: "on-the-screen" in sh._mirror.snapshot())
+    assert _wait(lambda: "on-the-screen" in sh._state.mirror.snapshot())
     note = sh.screenshot()
     assert isinstance(note, Note)
     assert "on-the-screen" in note.text
@@ -115,17 +115,17 @@ def test_altscreen_blocks_run(sh):
         sh.run("echo nope")
     # Leaving the alt-screen re-enables run(). Typing the leave command via
     # send() makes it an *interactive* command, so wait for its OSC 133 D to
-    # close the capture (sh._icap back to None), not just for the alt-screen
-    # byte — which lands mid-output, before D. At the instant altscreen flips
-    # False the capture is still open, so run() would otherwise race it and be
-    # refused as "busy with an interactive command".
+    # close the capture (sh._state.icap back to None), not just for the
+    # alt-screen byte — which lands mid-output, before D. At the instant
+    # altscreen flips False the capture is still open, so run() would otherwise
+    # race it and be refused as "busy with an interactive command".
     sh.send("printf '\\033[?1049l'\r")
-    assert _wait(lambda: sh.altscreen is False and sh._icap is None)
+    assert _wait(lambda: sh.altscreen is False and sh._state.icap is None)
     assert sh.run("echo back").text.strip() == "back"
 
 
 def test_screenshot_without_pyte_errors(sh, monkeypatch):
-    monkeypatch.setattr(sh, "_mirror", None)
+    monkeypatch.setattr(sh._state, "mirror", None)
     with pytest.raises(RuntimeError, match="pyte"):
         sh.screenshot()
 

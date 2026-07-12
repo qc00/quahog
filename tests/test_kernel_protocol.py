@@ -199,7 +199,7 @@ def test_screenshot_toolbar_click_wire_protocol(kernel):
     # Click on the SECOND view specifically.
     _, iopub = execute(
         kc,
-        "widget2 = h._views[-1][0]\n"
+        "widget2 = h._state.views[-1][0]\n"
         "h._on_widget_msg(widget2, {'type': 'screenshot'}, [])\n"
         "import time; time.sleep(0.5)\n",
         settle=1.0,
