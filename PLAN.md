@@ -1,47 +1,14 @@
 # Quahog — interactive console sessions captured in Jupyter notebooks
 
-**Name:** `quahog` — the hard-shell clam. Free on PyPI (verified 2026-07-10; `whelk`, `whorl`,
-`nacre` are taken). The pseudo-command prefix and magic are **`qua`** — long
-enough to be unambiguous and greppable, short enough to type: magic `%qua`/`%%qua`,
-pseudo-commands `quassh`, `quacp`, `quawsl`. No collisions with existing tools. Verified-free
-name alternates if the clam doesn't spark joy: `limpet`, `winkle`, `murex`, `cockle`.
-
-```python
-import quahog as q
-
-h = q.bash()                          # local session, console embeds in this cell's output
-```
-
-```
-%qua make test                          # line magic: run in default session, capture output
-```
-
-```
-%%qua prod                              # cell magic: run several commands in session "prod"
-cd /srv/app
-git pull
-systemctl --user restart app
-```
-
 ---
 
-## 1. Core principle: live console is ephemeral, text is canonical
+## 1. Operation overview
 
-> **The embedded console is a pure client-side view. The canonical record of every command is
-> plain text written into the cell's output area.**
+The state and interactions with a PTY are all captured in a `Session` and can be accessed in many ways:
 
-- Every command produces a `CommandResult` whose repr writes `text/plain` into the `.ipynb`
-  (what git and LLMs see). Two representations are kept and exposed:
-  - `r.raw` — the byte-faithful stream, escape sequences and all (also available per-command in
-    the sidecar recording),
-  - `r.text` — clean text with escapes stripped/rendered out (this is what goes in the cell).
-- The live console widget never stores anything in the notebook. Displaying, closing, or
-  hopping it never changes what's committed to git.
-- Secrets *displayed* in output are acceptable (a cell can be deleted); the invariant that
-  matters: **interactively typed passwords never reach disk** — not the notebook and not the
-  recording (§6).
-- Full keystroke recordings go to a visible, committable sidecar folder (§6), never into the
-  notebook JSON.
+- The primary UI is an XTerm.js-based console embedded in a Jupyter cell output.
+- There are also APIs in the `Session` to read/write/run commands against the PTY.
+- Various tools, interceptors and `qua` commands exist to improve user experience and scriptability.
 
 ---
 
@@ -50,17 +17,16 @@ systemctl --user restart app
 ```
 ┌────────────────────────── frontend (browser) ──────────────────────────┐
 │  anywidget view: xterm.js (+ fit, serialize, webgl addons)             │
-│  toolbar: hop · float(π) · terminal-app · serve · ⏸ · ⌫ · camera      │
+│  toolbar: session name · title · float · terminal · serve · record · erase · snapshot  │
 └───────────────▲────────────────────────────────────────────────────────┘
                 │ Jupyter comms (binary buffers for PTY bytes)
 ┌───────────────▼──────────────── kernel (Python) ────────────────────────┐
-│  quahog.Session ── registry; Popen-style API on every session           │
-│   ├─ PTY driver: ptyprocess/pexpect (unix), pywinpty/ConPTY (windows)   │
+│  quahog.Session                                                         │
+│   ├─ PTY driver: ptyprocess (unix), pywinpty/ConPTY (windows)           │
 │   ├─ Tap: OSC 133 parser, alt-screen detect, echo tracker, .cast writer │
-│   ├─ %qua / %%qua magics · quassh/quacp pseudo-command handling                 │
-│   ├─ minuter: transcript display + set_next_input queue (+ ipylab)      │
+│   ├─ %qua/%%qua magics · exec/fork sessions · qua cat/tar/download      │
 │   └─ attach server: unix socket → native window / telnet bridge         │
-│  Interceptors (entry_points "quahog.interceptors"): vim-diff, passwords │
+│  Interceptors: special handling for certain commands, passwords, etc.   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -68,14 +34,14 @@ systemctl --user restart app
 
 | Concern | Library | Why |
 |---|---|---|
-| Terminal rendering | **xterm.js** + fit/webgl addons | Full TTY emulation; what JupyterLab's own terminal uses |
+| Terminal rendering | **xterm.js** + fit addons | Full TTY emulation; what JupyterLab's own terminal uses |
 | Widget plumbing | **anywidget** | Works in JupyterLab, Notebook 7, VS Code, Colab; binary buffers over comms |
-| Local PTY (unix) | **pexpect / ptyprocess** | PTY spawn, resize, termios access |
+| Local PTY (unix) | **ptyprocess** | PTY spawn, resize, termios access |
 | Local PTY (windows) | **pywinpty** (ConPTY) | Real TTY for cmd.exe, PowerShell, and `wsl.exe` |
 | Command boundaries | **OSC 133** shell integration | In-band → works over ssh; industry standard |
-| Cell creation | **IPython `set_next_input` payload** (+ **ipylab** fast path when in Lab) | Kernel-side, works in VS Code; see §5 |
+| Command minutes writing | **IPython `set_next_input`** | Kernel-side, works in VS Code; see §5 |
 | Session recording | **asciicast v2** written by our own tap; replay via the `asciinema` CLI (out of scope: an in-notebook player) | Timestamped, committable, replayable |
-| Remote transport | **system OpenSSH** in a PTY + **ControlMaster**; **tmux control mode** (`-CC`) for implied sessions | Respects ~/.ssh/config, agents, ProxyJump |
+| Remote | **socat** pty for `exec` | PTY is the only channel that survives an arbitrary multi-step jump path. |
 | Screen state | **pyte** | Kernel-side "what's on screen" for prompt heuristics & screenshots |
 
 (p)npm is used to assemble the front-end JS and CSS, which are then packaged into the python as source.
@@ -84,32 +50,53 @@ systemctl --user restart app
 
 ## 3. Kernel-side model
 
-### `Session` — Popen-shaped, every one of them
+### `Session` — a live PTY with a small, subprocess.Popen-like surface
 
 ```python
 h = q.bash(cwd=..., env=...)          # also: q.zsh(), q.powershell(), q.cmd(), q.wsl(distro=None)
-h = q.ssh("user@host -J bastion")     # takes a real ssh command line — paste-friendly (§7)
-h = q.attach("name")                  # look up in q.sessions registry
 ```
 
-Every `Session` (not just forks) carries the `subprocess.Popen` vocabulary:
-`pid`, `returncode`, `poll()`, `wait(timeout)`, `terminate()`, `kill()`,
-`send_signal(sig)`, plus PTY-flavored I/O: `send(bytes)`, `sendline(str)`, `resize(rows, cols)`.
-`ForkHandle` (below) adds genuinely separate `stdout`/`stderr` file objects.
+Every `Session` carries
+- the **non-blocking** subset of the `subprocess.Popen` vocabulary as plain methods:
+  `pid`, `returncode`, `poll()`, `terminate()`, `kill()`, `send_signal(sig)`
+— plus PTY-flavored I/O:
+  `send(bytes)`, `sendline(str)`, `resize(rows, cols)`.
 
-Every handle also exposes **`h.stdin`** following the `sys.stdin` convention: a text file-like
+Anything that **waits** will eventually be refactored to a coroutine, awaited with Jupyter's native top-level `await`:
+`await h.wait()` for process exit, `await h.run(...)` / `await r.wait(...)`.
+Awaiting instead of blocking keeps the kernel event loop free, so live console views
+keep updating while you wait.
+
+`Session` also exposes **`h.stdin`** following the `sys.stdin` convention: a text file-like
 (`h.stdin.write("yes\n")`) with a raw byte layer underneath (`h.stdin.buffer.write(b"\x03")`).
 Programmatic keystrokes can bypass the recording: `record=False` on `send()`/`sendline()`, or
 the `h.stdin.raw` unrecorded variant — the bytes go to the PTY but the `.cast` gets only an
 `[input suppressed]` placeholder. This is the sanctioned path for feeding secrets from a
 keyring/vault into an interactive prompt without them ever touching disk.
 
-### Running commands: `%qua` magic first, method second
+### `SessionState` — all cross-thread state behind one lock
+
+Three kinds of thread touch a session at once: the PTY **reader thread** (drains bytes, drives
+the OSC tap, appends to the streams), the **kernel/event-loop thread** (widget input, resize,
+toolbar actions), and short-lived **worker threads** (auto-inject/reinject, copies). To avoid
+threading mistakes, every piece of mutable state shared across those threads lives in one
+`SessionState` object that owns a single lock and exposes only methods that take it.
+
+What moves inside: the scrollback ring, the pyte screen mirror, the OSC parser, the lifetime
+`raw`/`text` streams (plus their decoder and flush buffers), the active `run()` result, the
+interactive-capture state, the `minutes` list, the active-interceptor list, the input-dedup
+buffer, and the view registry. Methods return **snapshots** (`text()` hands back a `str`,
+`views()` a tuple copy); all I/O — xterm writes, `display`/`update_display_data`, `.cast`
+appends — happens *outside* the lock on the returned value, so the lock never spans a blocking
+send and one non-reentrant lock suffices. `Session` becomes a thin façade: PTY lifecycle, the
+Popen-ish surface, and orchestration, delegating all shared state to its `SessionState`.
+
+### Running commands
 
 ```
 %qua ls -la                     # line magic → default session (last created / q.default)
 %qua -s prod -t 300 make test   # explicit session, timeout
-%qua& tail -f app.log           # no-wait variant
+%qua tail -f app.log &          # trailing & (as in any shell) → don't wait for it
 ```
 
 ```
@@ -118,29 +105,56 @@ step one
 step two
 ```
 
-- The magic is sugar over `h.run(cmd, wait=True)`; the method remains for programmatic use
-  (`r = h.run("make test", wait=False)`; `r.wait()`, `r.done`, `r.returncode`, `r.raw`, `r.text`).
+- The `%qua`/`%%qua` magics are **synchronous**: they type the command and block the cell until
+  it finishes (`-t` sets a timeout), as today; a trailing `&` (or `-b`) returns immediately with
+  the live result. The programmatic method is a **coroutine**: `r = await h.run("make test",
+  timeout=300)`; for fire-and-forget, `r = await h.run("make test", wait=False)` hands back the
+  live result the moment the command is typed, and you `await r.wait()` / poll `r.done`,
+  `r.returncode`, `r.raw`, `r.text` later. Magic and method share **one** launch-and-capture
+  core; only the wait differs — a synchronous wait on the completion event for the magic, an
+  awaited bridge over the same event for the method.
 - Captured interactive commands (§5) are written as `%qua …` cells, so the recorded notebook
   stays terse and re-runnable.
-- **A new cell *type* is not possible**: the nbformat schema fixes `cell_type` to
-  code/markdown/raw; unknown types fail validation and every frontend (Lab, NB7, VS Code)
-  hard-codes the set. The portable equivalent is exactly this: a cell magic plus cell
-  metadata/tags (`{"quahog": {"session": "prod"}}`) that a styling extension *could* use later
-  for shell syntax highlighting in Lab. VS Code offers no hook for custom cell types either.
 - Mechanics: commands are typed into the PTY with bracketed paste; OSC 133 `C`→`D;<exit>`
   delimit output; `run()` refuses (or queues, opt-in) while the alt-screen is active.
-- A PTY merges stdout/stderr by nature — separated streams are what `fork()` is for.
+- A PTY merges stdout/stderr by nature — separated streams are what `fork()` is for (locally).
 
-### `h.fork()` — new command, new stdio, new handle
+### `h.exec()` and `h.fork()` — a command as its own object
 
-- **Local:** injected shell helper creates a FIFO trio, launches `cmd <f0 >f1 2>f2 &`; kernel
-  returns a `ForkHandle` with real separate `stdout`/`stderr`.
-- **Remote (mux):** `ssh -S <ctlpath> host cmd` — new exec channel, no re-auth, works through
-  bastions.
-- **Remote (implied tmux session, §7):** `tmux new-window` + `pipe-pane` capture — forking
-  without even a new ssh channel.
-- **Nested (user typed `ssh host2` inside the session):** the reinject handshake records the
-  hop chain → `ssh -S sock host1 -- ssh host2 -- cmd`. Best-effort, documented limits.
+`run()` types a command and folds its output into the cell. `exec()` and `fork()` instead hand
+back a session-like object with its own `text`/`raw`/`returncode`/`stdin` and a displayable
+console. They differ in the **channel** the command runs on:
+
+- **`h.exec(cmd, background=False, mirror=False) -> ExecSession`** runs the command on the
+  **current shell's own PTY** — wherever you're navigated to — so it needs nothing on the far
+  end but `socat`, which provides the command a pty (keeping `isatty()` true: colours,
+  tty-sensitive behaviour). A PTY is one merged stream, and the kernel can't tell one program's
+  bytes from another's on it, so exec's output is **tagged** to be demuxed into the
+  `ExecSession`: a filter strips escape sequences from the pty stream (which both yields clean
+  text and guarantees the payload can't contain the `BEL`/`ST` that would break the frame — so
+  no base64) and wraps each chunk as `OSC 2607;QUA;O;<id>;<clean text>`; completion emits
+  `OSC 2607;QUA;X;<id>;<rc>`, which the kernel reads and strips. This per-chunk tagging — not the
+  OSC 133 `C`/`D` time-brackets `run()` relies on — is exactly what makes **`background=True` /
+  a trailing `&`** work: a backgrounded job's output interleaves on the one tty with the live
+  shell, so only self-identifying chunks can be attributed to it. A *foreground* exec owns stdin
+  until the prompt returns (`session.stdin`/`sendline()` raise meanwhile; feed the command via
+  `handle.stdin`); a *backgrounded* one doesn't lock stdin (feeding a background job stdin is
+  limited — a bg process can't read the controlling tty — a documented gap). `mirror` decides
+  whether the exec's I/O is *also* folded into the parent's streams/console/recording (default
+  off — isolation is the point). One honest limit: the captured output is escape-stripped clean
+  text, so full-screen/binary fidelity lives in the console or a `screenshot()`, not the
+  `ExecSession`.
+
+- **`h.fork(cmd) -> ForkSession`** (**local sessions only**) runs the command over a fresh FIFO
+  trio the kernel creates (`cmd <f0 >f1 2>f2 &`, via the injected `__qua_fork`), which buys
+  genuinely separate `stdout`/`stderr` and true concurrency with the session — a single PTY
+  can't. Because the FIFOs live on the kernel's own filesystem, fork works only while the
+  session is on the **local** host; once you've navigated to a remote host the far shell can't
+  see them, so reach for `exec` there instead (it rides the PTY). Reach for fork when you need
+  the streams split; reach for exec when you need remote, or a live console for the command.
+  (A **remote** `fork()` — separate streams over a side channel such as a tmux pane — is a
+  candidate for a later release; the local FIFO path is what ships first.)
+
 
 ---
 
@@ -212,7 +226,8 @@ the last**.
   `since`/`until` accept a list index, a date/datetime, or the `LAST_DUMP` sentinel (the index
   after the last dumped entry, also readable as `h.last_dump`). `prefix_per_cmd`: `True` →
   one `%qua cmd` line per command (easy to split into cells); `False` → a single `%%qua`
-  header; `None` → bare commands. Returns the text.
+  header; `None` → bare commands. The cell is written directly via the `set_next_input`
+  payload; nothing is returned.
 - Toggle: `h.minuting = True/False` (plus a widget toolbar button later) — it only controls
   appending to the list. The feature is called **minuting**, as in writing the meeting
   minutes; deliberately nothing like the word "record", which §6 owns for keystroke recording.
@@ -226,7 +241,7 @@ the last**.
   session is *interactive*: `run()` blocks, minuting pauses, widget shows a badge and
   surfaces the screenshot button. `vim`, `less`, `htop` work naturally.
 - **Recording:** an option at session creation and forking — `q.bash(record=True)`,
-  `q.ssh("user@host", record=True)`, `h.fork(cmd, record=True)` (forks get their own `.cast`
+  `h.fork(cmd, record=True)`, `h.exec(cmd, record=True)` (forks and execs get their own `.cast`
   file, defaulting to the parent's setting) — plus `h.record(True/False)` as the runtime
   toggle. Recording tees PTY traffic into
   **asciicast v2** files in a *visible, committable* folder next to the notebook:
@@ -277,74 +292,76 @@ the last**.
 
 ---
 
-## 7. Shell integration & remote sessions
+## 7. Remote sessions: navigate interactively, operate over the PTY
+
+quahog doesn't connect to remote hosts for you. You reach one the way you would in any
+terminal — `ssh`, `sudo`, a restricted shell, whatever the path requires — from a local
+session, and quahog operates on **wherever that PTY currently sits**, tracking only
+what the shell integration reports (cwd, shell kind, whether integration is live). Every remote
+feature — `exec`/`fork` (§3) and copy (below) — rides the one channel that survives an arbitrary
+multi-step login: the interactive PTY byte stream.
+
+That single-channel constraint is deliberate: a real jump path
+often isn't a single tunnelable command line, and an ssh `ControlMaster` socket lives on the
+*client* host, out of the kernel's reach past the first hop — so a managed ssh/mux/ProxyJump
+layer would buy nothing that survives the navigation anyway.
 
 ### The injected snippet
 
 POSIX-sh/zsh/pwsh snippet typed as **plain (unencoded) shell source** via bracketed paste.
 Golf it as hard as we like to keep the paste short — the only rule is *no encoding or
-obfuscation*: `eval "$(base64 -d …)"` is a classic malware-delivery signature that can trip
-EDR/antivirus tooling. Bracketed paste handles the "survives weird terminals" problem; the
-source just has to be paste-safe (no tabs, no prompt-expansion traps):
+obfuscation* to avoid tripping antivirus tooling.
 
-- emits OSC 133 A/B/C/D + OSC 7 (cwd) + a quahog-private OSC handshake (shell kind, hostname,
-  depth — how nested-hop chains are tracked),
-- defines `__qua_fork` (FIFO trio), `__qua_snapshot` (interceptors), and the **in-console
-  pseudo-commands** `quassh` and `quacp` (below).
+- emits OSC 133 A/B/C/D + OSC 7 (cwd) + a quahog-private handshake (`OSC 2607;QUA;I`: shell
+  kind, host, user — confirms a successful (re)inject),
+- defines `__qua_snapshot` (interceptors), the `exec` markers `__qua_xb`/`__qua_xe`, and the
+  in-console copy pseudo-commands `quahog cat` / `quahog tar` / `quahog download` (below).
 
-`h.reinject()` re-types it after `su`, `docker exec`, hand-typed `ssh`, `exec zsh`. The widget
-shows an "integration lost — reinject?" hint when prompts stop carrying markers.
+`h.reinject(full=True)` re-types the whole snippet after `su`, `docker exec`, a hand-typed
+`ssh`, `exec zsh`, or a restricted shell that dropped it — required on any shell that can't
+source quahog's local file (i.e. anything remote). The widget shows an "integration lost —
+reinject?" hint when prompts stop carrying markers.
 
-### `quassh` — a pseudo-command, paste-friendly by design
+**The private OSC command number is `2607`**, chosen because it is unclaimed — the earlier
+`5522` collides with other tools. Every quahog payload is framed `OSC 2607 ; QUA ; <kind> ;
+<args…>`: the `QUA` signature means the kernel ignores any foreign sequence that ever reused
+the number, and quahog's own sequences stay inert in a terminal that doesn't know 2607. The
+`<kind>`s are `I` (handshake: shell/host/user), `E` (typed-command text — minuting and
+interceptors), `O`/`X` (exec output / exit — §3), and the copy requests (below).
 
-The primary interface is **a real ssh command line with a `q` in front**, usable in three
-places with identical syntax:
+### Running commands remotely
 
-```
-%quassh -J bastion user@host            # magic in a cell  → returns/binds a handle
-h = q.ssh("-J bastion user@host")     # same parser, programmatic
-quassh user@host                        # typed inside an existing quahog console:
-                                      # the injected function wraps real ssh and notifies the
-                                      # kernel via OSC → kernel binds a handle to the nested hop
-```
+`run()` and the `%qua`/`%%qua` magics work over **any integrated shell**: once you've navigated
+to a remote host and re-injected (below), the remote shell emits the same OSC 133 `C`/`D`
+markers, so typing a command and capturing its output is identical to local. `exec()` (§3)
+likewise works at any depth — nothing about it is ssh-specific; it acts on whatever shell the
+session is currently sitting in, riding the current PTY, so it needs only `socat` on the far
+end. The one exception is `fork()`: its separate streams come from kernel-local FIFOs, so it is
+a **local-session** feature for now (a remote fork over a tmux pane may come later); once you've
+navigated away, `exec` is the way to run a command as its own object.
 
-Under the hood: system OpenSSH in a PTY with `ControlMaster=auto` + `ControlPath` added
-(unless the user passed their own), so `~/.ssh/config`, agents, MFA prompts all behave — they
-appear in the embedded console like any terminal. On connect, auto-inject; `mux` keeps the
-control socket for `fork()` and `quacp`.
+### `quahog cat` / `quahog tar` / `quahog download` — file copy over the PTY
 
-### Multiplexers: not an argument, just the command line
-
-`screen`/`tmux` is expressed exactly as you'd write it in real ssh, and **`-t` keeps its real
-meaning**:
-
-```
-quassh user@host -t tmux    # TTY allocated → tmux UI appears → alt-screen/full-screen mode,
-                          # outermost alt-screen heuristic suppressed, OSC markers trusted
-quassh user@host tmux       # no -t: real ssh would die ("open terminal failed…") — quahog
-                          # reinterprets this as the *implied session*: it runs
-                          # `tmux -CC new -A -s quahog-<id>` (control mode) — headless text
-                          # protocol, no UI, session persists, reattachable after kernel
-                          # restart, and new-window/pipe-pane gives us remote fork() for free
-quassh user@host screen     # minimal support: `screen -dmS` + `screen -X stuff` command
-                          # injection; no control mode, so tmux is the recommended multiplexer
-```
-
-### `quacp` — file copy pseudo-command
+The injected `quahog` function emits a private OSC and the kernel performs
+the transfer over the same PTY channel — no scp, no ControlPath, working at any navigation depth.
 
 ```
-%quacp build/app.tar.gz prod:/srv/releases/     # scp-style; "prod" is a session name or host
-%quacp prod:/var/log/app.log ./logs/
-quacp ./notes.txt laptop:                        # typed *inside* a remote console: the injected
-                                               # function sends an OSC request; the kernel
-                                               # performs the copy over the mux socket
-q.cp(src, dst)  /  h.cp(src, dst)              # programmatic equivalents mirror quacp's name
-                                               # and path syntax exactly; on a handle, a bare
-                                               # (un-prefixed) path means "on this session"
+quahog cat build/app.tar.gz > /srv/app.tar.gz   # local → remote: kernel resolves the path
+                                                # relative to the notebook and streams the bytes
+                                                # into the PTY; it sends a length header first so
+                                                # the helper reads exactly that many (head -c) —
+                                                # binary-exact, no in-band EOF, no base64
+quahog tar somedir | (cd /dest && tar x)        # same, over a tar stream the kernel builds first
+cat /var/log/app.log | quahog download app.log  # remote → local: quahog download brackets its
+                                                # stdin with OSC start/end tags and base64-frames
+                                                # it (a file can't be escape-stripped, and its
+                                                # size is unknown while streaming, so base64 is
+                                                # the safe framing); the cell renders a download box
 ```
 
-Transport: `scp -o ControlPath` on the mux socket; nested chains stream tar through
-`ssh -S … host1 -- ssh host2 -- tar …`.
+Programmatic twins `h.upload()` / `h.download()` mirror these; typing the `quahog`
+pseudo-commands is the primary, paste-friendly interface. (VS Code's data-URI download handling
+is weaker than Lab/NB7 — verify and document, per §5.)
 
 ---
 
@@ -356,9 +373,10 @@ Transport: `scp -o ControlPath` on the mux socket; nested chains stream tar thro
 | OSC 133 markers | ✅ | ✅ (bash inside) | ✅ prompt + PSReadLine | ❌ |
 | `%qua` / `run()` with exit code | ✅ | ✅ | ✅ | ⚠️ sentinel wrap (`& echo <s> %errorlevel%`) |
 | Interactive → cells | ✅ | ✅ | ✅ | ❌ |
-| `fork()` | ✅ FIFOs | ✅ FIFOs in WSL fs | ✅ named pipes | ❌ |
+| `exec()` (own session) | ✅ socat pty | ✅ socat in WSL | ⚠️ pwsh port | ❌ |
+| `fork()` (separate streams, local only) | ✅ FIFOs | ✅ FIFOs in WSL fs | ⚠️ named pipes | ❌ |
 | Interceptors | ✅ | ✅ | ✅ | ❌ |
-| `quassh` target / `quacp` | ✅ | ✅ | ✅ (pwsh remote) | ❌ |
+| `quahog cat/tar/download` copy | ✅ | ✅ | ⚠️ pwsh port | ❌ |
 
 cmd.exe is deliberately bare-minimum: embed + sentinel-wrapped `run()`, nothing else.
 WSL is a first-class initial shell: Windows-side PTY, POSIX-side integration.
@@ -369,23 +387,26 @@ WSL is a first-class initial shell: Windows-side PTY, POSIX-side integration.
 
 ```
 quahog/
-  pyproject.toml            # hatchling; deps: anywidget, pexpect, ptyprocess; [win]: pywinpty; pyte
+  pyproject.toml            # hatchling; deps: anywidget, ptyprocess, ipython, pyte; [win]: pywinpty
   src/quahog/
-    __init__.py             # bash(), zsh(), powershell(), cmd(), wsl(), ssh(), attach(), sessions
-    magics.py               # %qua, %%qua, %quassh, %quacp
-    session.py              # Session (Popen-style), tap/fan-out, ring buffer
+    __init__.py             # bash(), zsh(), powershell(), cmd(), wsl(), sessions
+    magics.py               # %qua, %%qua
+    session.py              # Session façade: PTY lifecycle, async run()/wait(), fan-out
+    state.py                # SessionState: all cross-thread state behind one lock
     pty_unix.py  pty_win.py
-    osc.py                  # OSC 133/7/private parser (incremental)
-    result.py               # CommandResult (.raw/.text), ForkHandle
+    osc.py                  # OSC 133/7/2607 parser (incremental)
+    result.py               # CommandResult (.raw/.text; awaitable)
     record.py               # asciicast v2 writer, delayed-flush tail, echo classifier
-    minutes.py              # minuting: anchor transcript, set_next_input queue, ipylab path
+    minutes.py              # minuting: Note/Transcript side-output, dump_minutes_as_cell
     attach.py               # unix-socket attach server, telnet bridge, `python -m quahog attach`
-    inject/                 # posix.sh, zsh.zsh, pwsh.ps1 (+ quassh/quacp functions)
-    remote.py               # ssh cmdline parser, mux, tmux -CC driver, quacp transports
+    inject/                 # posix.sh, zsh.zsh, pwsh.ps1 (+ quahog cat/tar/download, exec markers)
+    runner.py               # exec(): ExecSession, socat-pty tagging, OSC 2607 O/X demux
+    copy.py                 # quahog cat/tar upload (length-framed) + download (base64) + box
+    fork.py                 # fork(): ForkSession over a local FIFO trio (local sessions only)
     interceptors/           # interceptor API + vim/nano/password built-ins
     widget/                 # anywidget ESM bundle (xterm.js vendored at build time), CSS
   js/                       # bundle sources; esbuild; npm is dev-only, output committed/shipped
-  tests/                    # pytest; PTY integration tests via pexpect against real bash
+  tests/                    # pytest; PTY integration tests against real bash
   examples/demo.ipynb
 ```
 
@@ -394,16 +415,21 @@ quahog/
 ## 10. Milestones
 
 1. **MVP (local bash):** Session + unix PTY, xterm.js embed with resize, OSC 133 inject/parse,
-   `run()`/`CommandResult` (`.raw`/`.text`), `%qua`/`%%qua` magics, Popen-style Session API,
-   registry. *Exit criterion: a committed notebook shows every command's output as plain text.*
-2. **Cells & hop:** anchor-cell transcript via `update_display` and `set_next_input`
-   queue-and-flush (validate both in VS Code explicitly), ipylab fast path, hop with
-   SerializeAddon freeze, multi-session, local `fork()`.
+   async `run()` / awaitable `CommandResult` (`.raw`/`.text`), `%qua`/`%%qua` magics, the
+   (mostly-sync) Popen-ish Session API, registry. *Exit criterion: a committed notebook shows
+   every command's output as plain text.*
+2. **Cells & multi-view:** every `display(h)` an independent live view (fan-out, **no hop**),
+   `text/plain` kept via `update_display_data`; pull-based `dump_minutes_as_cell` over a
+   `set_next_input` payload (validated in VS Code explicitly); multi-session; local `fork()`.
 3. **Recording & hygiene:** asciicast writer + `<notebook>.quahog/` sidecars, alt-screen mode,
    delayed-flush tail + echo classifier, ⏸/⌫ toolbar with flashing affordances, screenshot
    button, interceptor API (vim-diff + password interceptors).
-4. **Remote:** `quassh` (parser, mux, auto-inject, `reinject()`), fork over control socket,
-   `quacp`/`cp()`, tmux `-CC` implied sessions, `-t` full-screen path, bastion + nested hops.
+4. **Remote & concurrency (over the PTY):** reach targets by navigating interactively (real
+   ssh/sudo/restricted shells) + `reinject(full=True)`; the `OSC 2607;QUA` private channel;
+   `exec()` returning an `ExecSession` (socat pty, escape-stripped OSC-tagged output, `&`
+   support, `mirror`); local `fork()`/`ForkSession` over a FIFO trio (separate streams;
+   remote fork over a tmux pane deferred to a later release); `quahog cat`/`quahog tar`/`quahog
+   download` copy. (Managed ssh and hop chaining has been descoped.)
 5. **Pop-out extras & Windows:** terminal-app launch + telnet attach server; pywinpty backend,
    PowerShell integration, WSL, cmd.exe subset.
 
@@ -418,7 +444,16 @@ quahog/
   known to strip sequences — document.
 - **Remote echo correlation** can be confused by TUIs that consume input without echoing;
   consequence is only over-suppression of the recording, never leakage — acceptable bias.
-- **tmux -CC protocol** is semi-documented (iTerm2 is the reference consumer); budget time for
-  protocol quirks.
+- **`exec` output fidelity:** the tagger strips escape sequences, so the handle holds clean
+  text only — full-screen/binary output isn't faithfully captured there (console or
+  `screenshot()` for that). socat is assumed on targets; verify the exact pty address flags.
+- **Copy framing asymmetry:** upload is length-framed raw (kernel knows the size → binary-exact,
+  no base64); download must base64 (a file can't be escape-stripped and its streaming size is
+  unknown up front). Confirm large-file latency over the typed PTY path is acceptable.
+- **Async surface & the magics:** the programmatic waits are coroutines (top-level `await`),
+  while `%qua`/`%%qua` stay synchronous and block the cell (as today), sharing the same
+  launch-and-capture core and waiting on the completion event synchronously. Confirm a blocking
+  `%qua` doesn't starve *other* sessions' live views for longer than acceptable — if it does,
+  the fallback is async magics (verify IPython/ipykernel coroutine-magic support first).
 - **cmd.exe** stays capped by design; PowerShell/WSL are the real Windows targets.
 - Name availability re-verified at registration time; `quahog` free on PyPI as of 2026-07-10.

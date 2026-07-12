@@ -103,7 +103,6 @@ def test_registry_and_default():
     try:
         assert quahog.sessions[s.name] is s
         assert quahog.default is s
-        assert quahog.attach(s.name) is s
     finally:
         s.close()
         quahog.sessions.pop(s.name, None)

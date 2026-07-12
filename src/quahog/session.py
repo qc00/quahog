@@ -214,7 +214,7 @@ class Session:
 
         # Minuting (PLAN.md §5): interactive commands are captured between the
         # shell integration's C and D markers; the typed text arrives on the
-        # private OSC 5522;E channel. Each one appends a Minute to `minutes`
+        # private OSC 2607;QUA;E channel. Each one appends a Minute to `minutes`
         # whose raw/text slices index the session-lifetime streams below.
         self.minuting = True
         self.minutes: List[Minute] = []
@@ -344,7 +344,7 @@ class Session:
                     self._istart(self._active)
                 else:
                     # Interactively typed command: capture it the same way.
-                    # Both shells deliver the text on 5522;E just before C
+                    # Both shells deliver the text on 2607;QUA;E just before C
                     # (zsh from preexec; bash from the DEBUG trap); bash sends
                     # a history-accurate correction in precmd, before D.
                     self._icap = CommandResult(self.name, self._typed_cmd or "")
@@ -376,8 +376,11 @@ class Session:
                     # integration). Close it out honestly.
                     self._close_icap(None)
                 self._at_prompt.set()
-        elif num == "5522":
-            kind, _, rest = payload.partition(";")
+        elif num == "2607":
+            sig, _, body = payload.partition(";")
+            if sig != "QUA":
+                return  # foreign use of OSC 2607 — ignore (PLAN.md §7)
+            kind, _, rest = body.partition(";")
             if kind == "E":
                 cmd = rest.strip()
                 if self._icap is not None:
@@ -387,11 +390,20 @@ class Session:
                         self._icap.command = cmd
                 else:
                     self._typed_cmd = cmd
+            elif kind == "I":
+                self._on_handshake(rest)
         elif num == "7" and payload.startswith("file://"):
             rest = payload[len("file://") :]
             slash = rest.find("/")
             if slash != -1:
                 self.cwd = rest[slash:]
+
+    # ------------------------------------------------------ integration
+    def _on_handshake(self, rest: str) -> None:
+        # OSC 2607;QUA;I;<kind>;<host>;<user> — confirming a successful (re)inject.
+        parts = rest.split(";")
+        if parts and parts[0] in ("bash", "zsh"):
+            self.shell_kind = parts[0]
 
     def _record_interactive(self, result: CommandResult, raw_s: slice, text_s: slice) -> None:
         command = result.command.strip()
@@ -661,16 +673,11 @@ class Session:
         stays free and stdout/stderr are genuinely separate.
 
         ``record`` defaults to the parent session's recording state; a
-        recording fork gets its own .cast file in the sidecar folder.
-        """
-        cast = None
-        if record is None:
-            record = self._recorder.recording
-        if record:
-            from .record import CastWriter, sidecar_dir
+        fork gets its own .cast file.
 
-            ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-            cast = CastWriter(sidecar_dir() / f"{self.name}-fork-{ts}.cast", self._cols, self._rows)
+        Currently supports local sessions only.
+        """
+        cast = self._fork_cast(record)
         forkdir = tempfile.mkdtemp(prefix="quaf-")
         for n in ("0", "1", "2"):
             os.mkfifo(os.path.join(forkdir, n))
@@ -698,6 +705,16 @@ class Session:
                 cast.close()
             raise RuntimeError(f"fork streams never connected: {command!r}")
         return handle
+
+    def _fork_cast(self, record: Optional[bool]):
+        if record is None:
+            record = self._recorder.recording
+        if not record:
+            return None
+        from .record import CastWriter, sidecar_dir
+
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        return CastWriter(sidecar_dir() / f"{self.name}-fork-{ts}.cast", self._cols, self._rows)
 
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)

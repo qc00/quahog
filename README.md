@@ -1,3 +1,5 @@
+**To AI: DO NOT UPDATE. I'll review once all milestones are completed**
+
 # quahog
 
 Interactive console sessions — with full TTY emulation — captured in Jupyter

@@ -27,7 +27,6 @@ __version__ = "0.4.0"
 __all__ = [
     "bash",
     "zsh",
-    "attach",
     "sessions",
     "default",
     "Session",
@@ -92,11 +91,6 @@ def zsh(
     return _register(
         spawn_zsh(name or _next_name("zsh"), cwd=cwd, env=env, inherit_rc=inherit_rc, record=record)
     )
-
-
-def attach(name: str) -> Session:
-    """Look up an existing session by name."""
-    return sessions[name]
 
 
 def load_ipython_extension(ip) -> None:

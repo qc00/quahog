@@ -113,9 +113,14 @@ def test_altscreen_blocks_run(sh):
     assert _wait(lambda: sh.altscreen is True)
     with pytest.raises(RuntimeError, match="full-screen"):
         sh.run("echo nope")
-    # Leaving the alt-screen re-enables run().
+    # Leaving the alt-screen re-enables run(). Typing the leave command via
+    # send() makes it an *interactive* command, so wait for its OSC 133 D to
+    # close the capture (sh._icap back to None), not just for the alt-screen
+    # byte — which lands mid-output, before D. At the instant altscreen flips
+    # False the capture is still open, so run() would otherwise race it and be
+    # refused as "busy with an interactive command".
     sh.send("printf '\\033[?1049l'\r")
-    assert _wait(lambda: sh.altscreen is False)
+    assert _wait(lambda: sh.altscreen is False and sh._icap is None)
     assert sh.run("echo back").text.strip() == "back"
 
 
