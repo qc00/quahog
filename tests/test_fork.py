@@ -89,13 +89,13 @@ def test_fork_timeout_cleans_up_forkdir(sh, monkeypatch):
 
     monkeypatch.setattr(sh, "run", lambda *a, **kw: FakeResult())
 
-    real_init = session_mod.ForkHandle.__init__
+    real_init = session_mod.ForkSession.__init__
 
     def patched_init(self, *a, **kw):
         real_init(self, *a, **kw)
         self._opened = types.SimpleNamespace(wait=lambda timeout=None: False)
 
-    monkeypatch.setattr(session_mod.ForkHandle, "__init__", patched_init)
+    monkeypatch.setattr(session_mod.ForkSession, "__init__", patched_init)
 
     created = {}
     real_mkdtemp = session_mod.tempfile.mkdtemp

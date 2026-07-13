@@ -1,4 +1,4 @@
-from quahog.result import clean_text, CommandResult
+from quahog.sub_sessions import clean_text, CommandResult
 
 
 def test_strip_colors():

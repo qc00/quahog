@@ -1,4 +1,4 @@
-"""ForkHandle: a command launched by a session with fresh std streams.
+"""ForkSession: a command launched by a session with fresh std streams.
 
 fork() is the escape hatch from the PTY's merged output (PLAN.md §3): the
 injected __qua_fork helper runs ``sh -c CMD < f0 > f1 2> f2 &`` on a FIFO trio
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, TYPE_CHECKING, Union
 
 from . import utils
-from .result import clean_text
+from .sub_sessions import clean_text
 
 if TYPE_CHECKING:
     from .record import CastWriter
@@ -64,13 +64,8 @@ class _Drain(threading.Thread):
                     self._on_eof()
 
 
-class ForkHandle:
-    """Popen-shaped handle for one forked command.
-
-    ``cast``, if given, is a .cast writer (PLAN.md §6): both the out and err
-    ``_Drain`` streams tee their data into it as output events, and it closes
-    once both have hit EOF.
-    """
+class ForkSession:
+    """Popen-shaped handle for one forked command."""
 
     def __init__(self, session_name: str, command: str, dirpath: str, cast: Optional["CastWriter"] = None) -> None:
         self.session_name = session_name

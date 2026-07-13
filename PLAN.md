@@ -68,11 +68,10 @@ Awaiting instead of blocking keeps the kernel event loop free, so live console v
 keep updating while you wait.
 
 `Session` also exposes **`h.stdin`** following the `sys.stdin` convention: a text file-like
-(`h.stdin.write("yes\n")`) with a raw byte layer underneath (`h.stdin.buffer.write(b"\x03")`).
-Programmatic keystrokes can bypass the recording: `record=False` on `send()`/`sendline()`, or
-the `h.stdin.raw` unrecorded variant — the bytes go to the PTY but the `.cast` gets only an
-`[input suppressed]` placeholder. This is the sanctioned path for feeding secrets from a
-keyring/vault into an interactive prompt without them ever touching disk.
+(`h.stdin.write("yes\n")`) with a raw byte layer underneath (`h.stdin.raw.write(b"\x03")`).
+`h.stdin.raw` is the input-side counterpart of `h.raw`: bytes go to the PTY untouched, control
+characters and escape sequences included, with no encoding step in between.
+Both support `(record=False)` to bypass Asciicast recording, e.g. for programmatically sending passwords.
 
 ### `SessionState` — all cross-thread state behind one lock
 

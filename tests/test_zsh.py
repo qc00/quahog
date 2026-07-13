@@ -45,3 +45,24 @@ def test_zsh_fork(zs):
         assert f.stderr.strip() == "zf-err"
     finally:
         f.close()
+
+
+@pytest.mark.skipif(not shutil.which("socat") or not shutil.which("perl"), reason="exec needs socat+perl")
+def test_zsh_exec(zs):
+    es = zs.exec("echo zsh-exec; exit 3")
+    assert es.wait(15) == 3
+    assert "zsh-exec" in es.text
+
+
+def test_zsh_copy_roundtrip(zs, tmp_path, monkeypatch):
+    from quahog import copy as qcopy
+
+    monkeypatch.setattr(qcopy, "download_dir", lambda: tmp_path / "downloads")
+    data = bytes(range(256)) * 8
+    src = tmp_path / "s.bin"
+    src.write_bytes(data)
+    box = zs.download(str(src), name="z.bin")
+    assert box.data == data
+    dest = tmp_path / "o.bin"
+    zs.upload(str(src), str(dest))
+    assert dest.read_bytes() == data

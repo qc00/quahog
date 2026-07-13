@@ -18,7 +18,7 @@ from typing import Any, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from IPython.core.magic import Magics, line_magic, cell_magic, magics_class
 
-from .result import CommandResult, MultiResult
+from .sub_sessions import CommandResult, MultiResult
 
 if TYPE_CHECKING:
     from .session import Session

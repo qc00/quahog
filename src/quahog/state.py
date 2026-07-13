@@ -1,16 +1,19 @@
+from __future__ import annotations
+
 import codecs
 import re
 import threading
 import time
 from collections import deque
-from typing import Deque, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
+from typing import Deque, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 from .osc import StreamParser
-from .result import CommandResult, clean_text
+from .sub_sessions import CommandResult, clean_text
 
 if TYPE_CHECKING:
     from .screen import ScreenMirror
     from .session import ActiveInterceptor, Minute, View
+    from .sub_sessions import ExecSession
     from .widget import ConsoleView
 
 
@@ -89,6 +92,15 @@ class SessionState:
         self.typed_cmd: Optional[str] = None
         self.altscreen: bool = False
         self.iactive: List["ActiveInterceptor"] = []  # for the running command
+
+        self.execs: Dict[str, "ExecSession"] = {}
+        self.fg_exec: Optional[str] = None
+
+        # In-progress "quahog download" (PLAN.md §7): dl_active gates the base64
+        # payload between its Ds/De markers away from the console text.
+        self.dl_active: bool = False
+        self.dl_name: Optional[str] = None
+        self.dl_parts: List[str] = []
 
         self.minutes: List["Minute"] = []
         self.views: List["View"] = []
@@ -179,6 +191,15 @@ class SessionState:
                 self._text_parts.append(cleaned)
                 self._text_len += len(cleaned)
             return self._text_len
+
+    def append_external_text(self, s: str) -> None:
+        """Fold text that never came off this PTY (a mirror=True exec's output,
+        PLAN.md §3) into the lifetime streams so the console log shows it."""
+        with self.lock:
+            self._raw_parts.append(s)
+            self._raw_len += len(s)
+            self._text_parts.append(s)
+            self._text_len += len(s)
 
     def raw(self) -> str:
         """The session's data stream since start: escapes kept, markers

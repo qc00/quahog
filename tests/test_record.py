@@ -75,6 +75,18 @@ def test_echo_off_auto_suppression(rsh):
     assert any(e[1] == "i" and e[2] == PLACEHOLDER for e in events)
 
 
+def test_stdin_raw_records_by_default(rsh):
+    """.raw is the byte layer, not a recording bypass: it records like any
+    other input unless the caller asks for record=False (PLAN.md §3)."""
+    rsh.stdin.raw.write(b"echo raw-layer\r")
+    assert _wait(lambda: "raw-layer" in rsh.text)
+    rsh.close()
+
+    _, events = _events(rsh.cast_path)
+    ins = [e[2] for e in events if e[1] == "i"]
+    assert any("echo raw-layer" in i for i in ins)
+
+
 def test_stdin_raw_and_record_false(rsh):
     """The sanctioned secret-feeding paths leave only a placeholder."""
     r = rsh.run("read -s a; read -s b; echo lens:${#a}:${#b}", wait=False)
@@ -85,7 +97,7 @@ def test_stdin_raw_and_record_false(rsh):
     assert _wait(lambda: rsh._echo_on() is False)
     rsh.send("first-secret\r", record=False)
     assert _wait(lambda: rsh._echo_on() is False)
-    rsh.stdin.raw.write(b"second-secret\r")
+    rsh.stdin.raw.write(b"second-secret\r", record=False)
     r.wait(10)
     assert "lens:12:13" in r.text
     rsh.close()

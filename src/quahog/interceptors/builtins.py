@@ -118,7 +118,7 @@ class PasswordInterceptor:
         ctx.state["armed"] = False
 
     def on_output(self, ctx: Ctx, text: str) -> None:
-        from ..result import clean_text
+        from ..sub_sessions import clean_text
 
         tail = (ctx.state.get("tail", "") + clean_text(text))[-256:]
         ctx.state["tail"] = tail

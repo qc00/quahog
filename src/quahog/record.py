@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from . import utils
-from .result import clean_text
+from .sub_sessions import clean_text
 
 logger = logging.getLogger(__name__)
 log_exception_min = utils.LogExceptionMinimal(logger.debug)

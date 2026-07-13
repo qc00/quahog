@@ -1,9 +1,9 @@
 """quahog — interactive console sessions, captured in Jupyter notebooks.
 
-import quahog as q
-h = q.bash()          # spawn; display(h) embeds the live console
-r = h.run("ls -la")   # programmatic command; r.text / r.raw / r.returncode
-%qua make test        # magic sugar over run() on the default session
+    import quahog as q
+    h = q.bash()          # spawn; display(h) embeds the live console
+    r = h.run("ls -la")   # programmatic command; r.text / r.raw / r.returncode
+    %qua make test        # magic sugar over run() on the default session
 """
 
 from __future__ import annotations
@@ -13,9 +13,10 @@ from typing import Any, Dict, Optional
 
 from . import interceptors  # noqa: F401
 from . import utils
-from .fork import ForkHandle  # noqa: F401
+from .fork import ForkSession  # noqa: F401
+from .copy import DownloadBox  # noqa: F401
 from .minutes import Note  # noqa: F401
-from .result import CommandResult, MultiResult, clean_text  # noqa: F401
+from .sub_sessions import CommandResult, ExecSession, MultiResult, clean_text  # noqa: F401
 from .session import (  # noqa: F401
     LAST_DUMP,
     Minute,
@@ -37,7 +38,9 @@ __all__ = [
     "Session",
     "CommandResult",
     "MultiResult",
-    "ForkHandle",
+    "ForkSession",
+    "ExecSession",
+    "DownloadBox",
     "Minute",
     "Note",
     "LAST_DUMP",

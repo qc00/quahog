@@ -65,7 +65,13 @@ class Transcript:
     def _repr_mimebundle_(
         self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
     ) -> Dict[str, Any]:
-        return {"text/plain": self._plain()}
+        bundle = {"text/plain": self._plain()}
+        # A block may offer richer HTML (a download box's data-URI link); if any
+        # does, surface it so Lab/NB7 render the link rather than plain text.
+        html = [b._html() for b in self.blocks if hasattr(b, "_html")]
+        if html:
+            bundle["text/html"] = "<br>".join(html)
+        return bundle
 
     def __repr__(self) -> str:
         return self._plain()

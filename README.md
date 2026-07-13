@@ -85,7 +85,8 @@ Input is auto-replaced with `[input suppressed]` when the local terminal is in
 canonical no-echo mode (`read -s`, `passwd`, `sudo` with `pwfeedback`) or a
 password interceptor has pre-armed suppression for a matched remote prompt
 (`sudo`/`su`/`ssh`/`passwd`). Feed secrets from a keyring without ever
-recording them: `h.send(secret, record=False)` or `h.stdin.raw.write(...)`.
+recording them: `h.send(secret, record=False)` or
+`h.stdin.raw.write(secret, record=False)`.
 Widget toolbar: ⏸ pause/resume, ⌫ erase (flashes on an un-echoed or masked
 keystroke), camera for a screenshot.
 
