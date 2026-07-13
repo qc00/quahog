@@ -9,20 +9,35 @@ the helper (the process is the shell's child, not ours, so no waitpid).
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import signal
 import threading
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Optional, TYPE_CHECKING, Union
 
+from . import utils
 from .result import clean_text
+
+if TYPE_CHECKING:
+    from .record import CastWriter
+
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
 
 
 class _Drain(threading.Thread):
     """Reads one FIFO to EOF into a buffer, so writers never block."""
 
-    def __init__(self, path: str, label: str, on_data=None, on_eof=None) -> None:
+    def __init__(
+        self,
+        path: str,
+        label: str,
+        on_data: Optional[Callable[[bytes], None]] = None,
+        on_eof: Optional[Callable[[], None]] = None,
+    ) -> None:
         super().__init__(name=f"quahog-fork-{label}", daemon=True)
         self._path = path
         self._on_data = on_data
@@ -38,25 +53,26 @@ class _Drain(threading.Thread):
                     break
                 self.buf += chunk
                 if self._on_data is not None:
-                    try:
+                    with log_exception_min:
                         self._on_data(chunk)
-                    except Exception:
-                        pass
         except OSError:
-            pass
+            log_exception_min()
         finally:
             os.close(fd)
             if self._on_eof is not None:
-                try:
+                with log_exception_min:
                     self._on_eof()
-                except Exception:
-                    pass
 
 
 class ForkHandle:
-    """Popen-shaped handle for one forked command."""
+    """Popen-shaped handle for one forked command.
 
-    def __init__(self, session_name: str, command: str, dirpath: str, cast=None) -> None:
+    ``cast``, if given, is a .cast writer (PLAN.md §6): both the out and err
+    ``_Drain`` streams tee their data into it as output events, and it closes
+    once both have hit EOF.
+    """
+
+    def __init__(self, session_name: str, command: str, dirpath: str, cast: Optional["CastWriter"] = None) -> None:
         self.session_name = session_name
         self.command = command
         self.pid: Optional[int] = None
@@ -65,9 +81,6 @@ class ForkHandle:
         self._stdin_fd: Optional[int] = None
         self._opened = threading.Event()
 
-        # Optional recording (PLAN.md §6): a fork gets its own .cast file.
-        # Both streams tee into it as output events; the writer closes when
-        # both hit EOF.
         self._cast = cast
         self._cast_lock = threading.Lock()
         self._cast_open_streams = 2
@@ -88,7 +101,7 @@ class ForkHandle:
                 self._err.start()
                 self._opened.set()
             except OSError:
-                pass
+                log_exception_min()
 
         threading.Thread(target=_open, name="quahog-fork-open", daemon=True).start()
 
@@ -121,10 +134,10 @@ class ForkHandle:
                 self._cast.close()
 
     @property
-    def cast_path(self):
+    def cast_path(self) -> Optional[Path]:
         return self._cast.path if self._cast is not None else None
 
-    def send(self, data, record: bool = True) -> None:
+    def send(self, data: Union[bytes, str], record: bool = True) -> None:
         if self._stdin_fd is None:
             raise RuntimeError("stdin not connected yet")
         raw = data if isinstance(data, bytes) else str(data).encode()
@@ -158,7 +171,7 @@ class ForkHandle:
                 if text:
                     self._rc = int(text)
             except (FileNotFoundError, ValueError):
-                pass
+                log_exception_min()
         return self._rc
 
     @property
@@ -223,7 +236,9 @@ class ForkHandle:
             parts.append(state)
         return "\n".join(parts)
 
-    def _repr_mimebundle_(self, include=None, exclude=None):
+    def _repr_mimebundle_(
+        self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
+    ) -> Dict[str, Any]:
         return {
             "text/plain": self._plain(),
             "application/vnd.quahog.output+json": {

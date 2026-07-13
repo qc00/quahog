@@ -1,17 +1,3 @@
-"""Incremental parser splitting a PTY byte stream into data spans and OSC events.
-
-The tap feeds every chunk read from the PTY through a StreamParser. The parser
-never alters the byte stream (the widget receives the original bytes); it just
-classifies them, so the session can capture command output between the
-OSC 133;C and OSC 133;D markers and exclude the markers themselves.
-
-Only OSC sequences (ESC ] ... BEL | ESC \\) are lifted out as events. CSI/SGR
-color sequences etc. stay inside "data" spans on purpose: they belong to
-CommandResult.raw.
-"""
-
-from __future__ import annotations
-
 from typing import List, Tuple, Union
 
 # A token is either ("data", bytes) or ("osc", number_str, payload_str).
@@ -25,6 +11,18 @@ _MAX_OSC = 8192
 
 
 class StreamParser:
+    """Incremental parser splitting a PTY byte stream into data spans and OSC events.
+
+    The tap feeds every chunk read from the PTY through a StreamParser. The parser
+    never alters the byte stream (the widget receives the original bytes); it just
+    classifies them, so the session can capture command output between the
+    OSC 133;C and OSC 133;D markers and exclude the markers themselves.
+
+    Only OSC sequences (ESC ] ... BEL | ESC \\) are lifted out as events. CSI/SGR
+    color sequences etc. stay inside "data" spans on purpose: they belong to
+    CommandResult.raw.
+    """
+
     def __init__(self) -> None:
         self._pend = b""
 

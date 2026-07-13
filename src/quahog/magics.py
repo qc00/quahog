@@ -14,12 +14,17 @@ as %qua cells, so this is also the replay format.
 
 from __future__ import annotations
 
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING, Union
+
 from IPython.core.magic import Magics, line_magic, cell_magic, magics_class
 
-from .result import MultiResult
+from .result import CommandResult, MultiResult
+
+if TYPE_CHECKING:
+    from .session import Session
 
 
-def _resolve_session(name):
+def _resolve_session(name: Optional[str]) -> "Session":
     import quahog
 
     if name:
@@ -36,7 +41,7 @@ def _resolve_session(name):
 
 @magics_class
 class QuahogMagics(Magics):
-    def _parse(self, line, positional_session=False):
+    def _parse(self, line: str, positional_session: bool = False) -> Tuple["Session", Optional[float], bool, str]:
         opts, arg = self.parse_options(line, "s:t:b", mode="string")
         name = opts.get("s")
         if positional_session and not name and arg.strip():
@@ -47,17 +52,17 @@ class QuahogMagics(Magics):
         return session, timeout, wait, arg
 
     @line_magic("qua")
-    def qua(self, line):
+    def qua(self, line: str) -> Union["Session", CommandResult]:
         session, timeout, wait, command = self._parse(line)
         if not command.strip():
             return session
         return session.run(command, wait=wait, timeout=timeout)
 
     @cell_magic("qua")
-    def qua_cell(self, line, cell):
+    def qua_cell(self, line: str, cell: str) -> MultiResult:
         # ``%%qua prod`` — bare positional session name, as minuting emits it.
         session, timeout, wait, _ = self._parse(line, positional_session=True)
-        results = []
+        results: List[CommandResult] = []
         for raw in cell.splitlines():
             command = raw.strip()
             if not command or command.startswith("#"):
@@ -66,5 +71,5 @@ class QuahogMagics(Magics):
         return MultiResult(results)
 
 
-def load_ipython_extension(ip) -> None:
+def load_ipython_extension(ip: Any) -> None:
     ip.register_magics(QuahogMagics(ip))

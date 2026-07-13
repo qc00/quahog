@@ -1,38 +1,35 @@
-"""SessionState: all of a Session's cross-thread mutable state behind one lock.
-
-Access patterns:
-
-- the reader loop takes ``with state.lock:`` once and drives the whole token
-  batch as a single critical section.
-- everyone else uses the locked helper methods, which return **snapshots**
-  (``text()`` a ``str``, ``views_snapshot()`` a list copy). All blocking I/O —
-  xterm writes, ``display``/``update_display_data``, ``.cast`` appends — happens
-  on those snapshots, *outside* the lock, so the lock never spans a blocking
-  send and a single reentrant lock suffices.
-
-``Session`` is a façade over this, delegating all shared state here.
-"""
-
-from __future__ import annotations
-
 import codecs
 import re
 import threading
 import time
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import Deque, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 from .osc import StreamParser
 from .result import CommandResult, clean_text
+
+if TYPE_CHECKING:
+    from .screen import ScreenMirror
+    from .session import ActiveInterceptor, Minute, View
+    from .widget import ConsoleView
+
+
+class RecentInput(NamedTuple):
+    """One recent keystroke/reply, kept briefly to dedup retried or
+    cross-view terminal-capability replies (see ``is_duplicate_input``)."""
+
+    time: float
+    source: Optional["ConsoleView"]
+    data: bytes
 
 
 class _Ring:
     """Bounded scrollback of raw PTY bytes, replayed to newly attached views."""
 
     def __init__(self, cap: int = 2_000_000) -> None:
-        self._chunks: deque = deque()
-        self.size = 0
-        self._cap = cap
+        self._chunks: Deque[bytes] = deque()
+        self.size: int = 0
+        self._cap: int = cap
 
     def append(self, b: bytes) -> None:
         self._chunks.append(b)
@@ -62,11 +59,24 @@ _TERMINAL_REPLY_RE = re.compile(
 
 
 class SessionState:
-    """Every field a Session shares across threads, plus the one lock."""
+    """SessionState: all of a Session's cross-thread mutable state behind one lock.
+
+    Access patterns:
+
+    - the reader loop takes ``with state.lock:`` once and drives the whole token
+    batch as a single critical section.
+    - everyone else uses the locked helper methods, which return **snapshots**
+    (``text()`` a ``str``, ``views_snapshot()`` a list copy). All blocking I/O —
+    xterm writes, ``display``/``update_display_data``, ``.cast`` appends — happens
+    on those snapshots, *outside* the lock, so the lock never spans a blocking
+    send and a single reentrant lock suffices.
+
+    ``Session`` is a façade over this, delegating all shared state here.
+    """
 
     _DEDUP_WINDOW = 0.15  # seconds
 
-    def __init__(self, mirror=None) -> None:
+    def __init__(self, mirror: Optional["ScreenMirror"] = None) -> None:
         self.lock = threading.RLock()
         self._ring = _Ring()
         self.mirror = mirror
@@ -77,14 +87,13 @@ class SessionState:
         self.icap: Optional[CommandResult] = None
         self.icap_marks: Optional[Tuple[int, int]] = None  # (raw_start, text_start)
         self.typed_cmd: Optional[str] = None
-        self.altscreen = False
-        self.iactive: List[tuple] = []  # (interceptor, ctx) for the running command
+        self.altscreen: bool = False
+        self.iactive: List["ActiveInterceptor"] = []  # for the running command
 
-        self.minutes: List = []
-        self.views: List[tuple] = []
+        self.minutes: List["Minute"] = []
+        self.views: List["View"] = []
 
-        # Input dedup buffer: (time, source, data) — see is_duplicate_input.
-        self._recent_input: List[tuple] = []
+        self._recent_input: List[RecentInput] = []
 
         # Session-lifetime streams. ``raw`` is the decoded data stream with
         # markers stripped but escapes kept; ``text`` is its cleaned form,
@@ -185,29 +194,29 @@ class SessionState:
         return done + tail
 
     # -- minuting ------------------------------------------------------------
-    def append_minute(self, minute) -> None:
+    def append_minute(self, minute: "Minute") -> None:
         with self.lock:
             self.minutes.append(minute)
 
-    def minutes_snapshot(self) -> list:
+    def minutes_snapshot(self) -> List["Minute"]:
         with self.lock:
             return list(self.minutes)
 
     # -- interceptors --------------------------------------------------------
-    def iactive_snapshot(self) -> list:
+    def iactive_snapshot(self) -> List["ActiveInterceptor"]:
         with self.lock:
             return list(self.iactive)
 
     # -- views ---------------------------------------------------------------
-    def add_view(self, view: tuple) -> None:
+    def add_view(self, view: "View") -> None:
         with self.lock:
             self.views.append(view)
 
-    def prune_view(self, widget) -> None:
+    def prune_view(self, widget: "ConsoleView") -> None:
         with self.lock:
-            self.views = [v for v in self.views if v[0] is not widget]
+            self.views = [v for v in self.views if v.widget is not widget]
 
-    def views_snapshot(self) -> list:
+    def views_snapshot(self) -> List["View"]:
         with self.lock:
             return list(self.views)
 
@@ -216,7 +225,7 @@ class SessionState:
             return bool(self.views)
 
     # -- input dedup ---------------------------------------------------------
-    def is_duplicate_input(self, data: bytes, source) -> bool:
+    def is_duplicate_input(self, data: bytes, source: Optional["ConsoleView"]) -> bool:
         """A full-screen app querying the terminal for its own capabilities can
         retry if a reply doesn't arrive within its own short timeout — plausible
         over the browser/kernel round trip a widget's input takes. If replies
@@ -234,13 +243,13 @@ class SessionState:
         character is content no reply ever takes, so it's never touched)."""
         with self.lock:
             now = time.monotonic()
-            self._recent_input = [(t, s, d) for t, s, d in self._recent_input if now - t < self._DEDUP_WINDOW]
+            self._recent_input = [e for e in self._recent_input if now - e.time < self._DEDUP_WINDOW]
             is_reply = bool(_TERMINAL_REPLY_RE.match(data))
             if not is_reply and not data.startswith(b"\x1b"):
-                self._recent_input.append((now, source, data))
+                self._recent_input.append(RecentInput(now, source, data))
                 return False
-            for _t, s, d in self._recent_input:
-                if d == data and (is_reply or s is not source):
+            for e in self._recent_input:
+                if e.data == data and (is_reply or e.source is not source):
                     return True
-            self._recent_input.append((now, source, data))
+            self._recent_input.append(RecentInput(now, source, data))
             return False

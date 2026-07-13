@@ -20,7 +20,7 @@ per execution is honored. See PLAN.md §5.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 class Note:
@@ -33,7 +33,9 @@ class Note:
     def _plain(self) -> str:
         return self.text
 
-    def _repr_mimebundle_(self, include=None, exclude=None):
+    def _repr_mimebundle_(
+        self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
+    ) -> Dict[str, Any]:
         return {"text/plain": self.text}
 
     def __repr__(self) -> str:
@@ -60,7 +62,9 @@ class Transcript:
         lines.extend(b._plain() for b in self.blocks)
         return "\n".join(lines)
 
-    def _repr_mimebundle_(self, include=None, exclude=None):
+    def _repr_mimebundle_(
+        self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
+    ) -> Dict[str, Any]:
         return {"text/plain": self._plain()}
 
     def __repr__(self) -> str:

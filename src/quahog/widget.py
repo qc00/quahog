@@ -1,4 +1,5 @@
 import pathlib
+from typing import Any
 
 import anywidget
 import traitlets
@@ -12,7 +13,7 @@ class ConsoleView(anywidget.AnyWidget):
 
     session_name = traitlets.Unicode("").tag(sync=True)
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._text = ""
 

@@ -9,6 +9,7 @@ CommandResult text; the widget is a pure client-side view.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import os
 import shlex
 import shutil
@@ -16,18 +17,31 @@ import signal
 import tempfile
 import threading
 from pathlib import Path
-from typing import Dict, NamedTuple, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, TYPE_CHECKING, Union
 
 from . import interceptors as _interceptors
+from . import utils
 from .fork import ForkHandle
+from .interceptors import Ctx, Interceptor
 from .minutes import Note, Transcript
+from .osc import Token
 from .record import Recorder
 from .result import CommandResult
 from .state import SessionState
 
+if TYPE_CHECKING:
+    from IPython.core.display_functions import DisplayHandle
+
+    from .record import CastWriter
+    from .widget import ConsoleView
+
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
+
 try:
     from .screen import ScreenMirror
 except Exception:  # pyte missing: sessions still work, screenshots don't
+    log_exception_min()
     ScreenMirror = None
 
 
@@ -57,6 +71,25 @@ class Minute(NamedTuple):
     raw: slice
     text: slice
     returncode: Optional[int] = None
+
+
+class ActiveInterceptor(NamedTuple):
+    """One interceptor matched against the currently-running command, plus
+    its per-command ``Ctx`` (``SessionState.iactive``)."""
+
+    interceptor: Interceptor
+    ctx: Ctx
+
+
+class View(NamedTuple):
+    """One live display of a session (``SessionState.views``): the widget, its
+    ``display()`` handle, the second notes-output handle, and the parent cell
+    header captured for ``_publish_note_to`` (PLAN.md §6)."""
+
+    widget: "ConsoleView"
+    handle: "DisplayHandle"
+    notes: Transcript
+    header: Optional[Dict[str, Any]]
 
 
 _INJECT_DIR = Path(__file__).parent / "inject"
@@ -97,7 +130,7 @@ class _Stdin:
         def __init__(self, session: "Session") -> None:
             self._s = session
 
-        def write(self, data) -> int:
+        def write(self, data: Union[bytes, str]) -> int:
             data = data if isinstance(data, bytes) else str(data).encode()
             self._s._input(data, record=False)
             return len(data)
@@ -121,9 +154,11 @@ class _Stdin:
 class Session:
     """One live shell in a PTY. Popen vocabulary plus run()/display."""
 
+    _PROMPT_WAIT = 10.0
+
     def __init__(
         self,
-        argv,
+        argv: List[str],
         name: str,
         shell_kind: str = "bash",
         cwd: Optional[str] = None,
@@ -153,8 +188,6 @@ class Session:
         self.stdin = _Stdin(self)
         self._transcript = Transcript(name)
 
-        # Recording & hygiene (PLAN.md §6). The recorder exists even when not
-        # recording so the toolbar and interceptors always have a target.
         self._recorder = Recorder(name, on_event=self._on_rec_event)
 
         # Minuting (PLAN.md §5): `minuting` gates appending; `last_dump` is the
@@ -163,18 +196,12 @@ class Session:
         self.minuting = True
         self.last_dump = 0
 
-        # Every piece of state shared across the reader/kernel/worker threads —
-        # scrollback ring, pyte mirror, OSC parser, lifetime raw/text streams,
-        # the command FSM, minutes, the view registry, the input-dedup buffer —
-        # lives behind one lock in SessionState (PLAN.md §3). The mirror tracks
-        # the alt-screen switch that marks full-screen apps; it needs pyte,
-        # which may be absent (sessions still work, screenshots don't).
+        # The pyte mirror needs pyte, which may be absent (sessions still
+        # work, screenshots don't).
         mirror = None
         if ScreenMirror is not None:
-            try:
+            with log_exception_min:
                 mirror = ScreenMirror(rows, cols)
-            except Exception:
-                pass  # pyte missing or misbehaving: sessions still work
         self._state = SessionState(mirror=mirror)
         if record:
             self._recorder.start(rows, cols)
@@ -187,13 +214,14 @@ class Session:
 
     # ------------------------------------------------------------------ tap
     @staticmethod
-    def _find_kernel():
+    def _find_kernel() -> Any:
         try:
             from IPython import get_ipython
 
             ip = get_ipython()
             return getattr(ip, "kernel", None)
         except Exception:
+            log_exception_min()
             return None
 
     def _read_loop(self) -> None:
@@ -203,6 +231,7 @@ class Session:
             try:
                 data = os.read(fd, 65536)
             except OSError:
+                log_exception_min()
                 data = b""
             if not data:
                 break
@@ -233,7 +262,7 @@ class Session:
         text_s = slice(marks[1], st.text_boundary()) if marks else slice(0, 0)
         self._record_interactive(icap, raw_s, text_s)
 
-    def _on_token(self, tok) -> None:
+    def _on_token(self, tok: Token) -> None:
         st = self._state
         if tok[0] == "data":
             if not st.altscreen:
@@ -246,10 +275,8 @@ class Session:
                 for itc, ctx in st.iactive:
                     fn = getattr(itc, "on_output", None)
                     if fn is not None:
-                        try:
+                        with log_exception_min:
                             fn(ctx, text)
-                        except Exception:
-                            pass
             return
         _, num, payload = tok
         if num == "133":
@@ -359,20 +386,19 @@ class Session:
         try:
             argv = shlex.split(command)
         except ValueError:
+            log_exception_min()
             argv = command.split()
         if not argv:
             return
         for itc in _interceptors.all_interceptors():
-            try:
+            with log_exception_min:
                 if not itc.match(argv, self):
                     continue
-                ctx = _interceptors.Ctx(self, argv, command)
+                ctx = Ctx(self, argv, command)
                 fn = getattr(itc, "before", None)
                 if fn is not None:
                     fn(ctx)
-                self._state.iactive.append((itc, ctx))
-            except Exception:
-                pass
+                self._state.iactive.append(ActiveInterceptor(itc, ctx))
 
     def _ifinish(self, result: Optional[CommandResult]) -> None:
         """Command ended (OSC 133;D or forced close): run after() hooks,
@@ -380,11 +406,9 @@ class Session:
         active, self._state.iactive = self._state.iactive, []
         for itc, ctx in active:
             out = None
-            try:
+            with log_exception_min:
                 fn = getattr(itc, "after", None)
                 out = fn(ctx) if fn is not None else None
-            except Exception:
-                out = None
             ctx._release_all()
             if out and result is not None:
                 result.notes.append(str(out))
@@ -407,7 +431,7 @@ class Session:
         return self._state.altscreen
 
     @property
-    def minutes(self) -> list:
+    def minutes(self) -> List[Minute]:
         """Interactively typed commands, each a Minute (PLAN.md §5)."""
         return self._state.minutes_snapshot()
 
@@ -471,14 +495,12 @@ class Session:
         else:
             text = "\n".join(commands)
 
-        try:
+        with log_exception_min:
             from IPython import get_ipython
 
             ip = get_ipython()
             if ip is not None and getattr(ip, "payload_manager", None) is not None:
                 ip.payload_manager.write_payload({"source": "set_next_input", "text": text, "replace": False})
-        except Exception:
-            pass
 
     def _refresh_views(self) -> None:
         """Push the current session text to every live view's primary output
@@ -490,12 +512,10 @@ class Session:
         text = self.text
 
         def _update() -> None:
-            for widget, handle, _notes, _header in views:
-                try:
-                    widget._text = text
-                    handle.update(widget)
-                except Exception:
-                    pass
+            for view in views:
+                with log_exception_min:
+                    view.widget._text = text
+                    view.handle.update(view.widget)
 
         loop = getattr(self._kernel, "io_loop", None)
         if loop is not None:
@@ -516,11 +536,9 @@ class Session:
         transcript = self._transcript
 
         def _update() -> None:
-            for _widget, _handle, notes, _header in views:
-                try:
-                    notes.update(transcript)
-                except Exception:
-                    pass
+            for view in views:
+                with log_exception_min:
+                    view.notes.update(transcript)
 
         loop = getattr(self._kernel, "io_loop", None)
         if loop is not None:
@@ -529,10 +547,8 @@ class Session:
             _update()
 
     def _on_exit(self) -> None:
-        try:
+        with log_exception_min:
             self._proc.wait()
-        except Exception:
-            pass
         self._returncode = self._proc.exitstatus
         if self._returncode is None and self._proc.signalstatus is not None:
             self._returncode = -self._proc.signalstatus
@@ -631,7 +647,7 @@ class Session:
             raise RuntimeError(f"fork streams never connected: {command!r}")
         return handle
 
-    def _fork_cast(self, record: Optional[bool]):
+    def _fork_cast(self, record: Optional[bool]) -> Optional["CastWriter"]:
         if record is None:
             record = self._recorder.recording
         if not record:
@@ -644,7 +660,7 @@ class Session:
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)
 
-    def _input(self, data: bytes, record: bool = True, source=None) -> None:
+    def _input(self, data: bytes, record: bool = True, source: Optional["ConsoleView"] = None) -> None:
         """Every user/programmatic keystroke funnels through here: dedup of
         retried/cross-view terminal-capability replies (SessionState), recording
         (with termios ECHO auto-suppression), interceptor on_input hooks, then
@@ -655,10 +671,8 @@ class Session:
         for itc, ctx in self._state.iactive_snapshot():
             fn = getattr(itc, "on_input", None)
             if fn is not None:
-                try:
+                with log_exception_min:
                     fn(ctx, data)
-                except Exception:
-                    pass
         self._write(data)
 
     def _echo_on(self) -> Optional[bool]:
@@ -681,6 +695,7 @@ class Session:
                 return None  # raw mode: not classifiable this way
             return bool(lflag & termios.ECHO)
         except Exception:
+            log_exception_min()
             return None
 
     # ----------------------------------------------------------- Popen face
@@ -706,10 +721,8 @@ class Session:
         self._proc.kill(sig)
 
     def terminate(self) -> None:
-        try:
+        with log_exception_min:
             self._proc.terminate()
-        except Exception:
-            pass
 
     def kill(self) -> None:
         self.send_signal(signal.SIGKILL)
@@ -718,7 +731,7 @@ class Session:
         """Ctrl-C through the PTY (goes to the foreground process group)."""
         self._input(b"\x03")
 
-    def send(self, data, record: bool = True) -> None:
+    def send(self, data: Union[bytes, str], record: bool = True) -> None:
         self._input(data if isinstance(data, bytes) else str(data).encode(), record=record)
 
     def sendline(self, line: str = "", record: bool = True) -> None:
@@ -782,12 +795,13 @@ class Session:
                 try:
                     self._transcript.cast = os.path.relpath(cast)
                 except ValueError:
+                    log_exception_min()
                     self._transcript.cast = str(cast)
             else:
                 self._transcript.cast = None
             self._refresh_notes()  # the "[recording: ...]" line changed
 
-    def _emit_rec_state(self, widget=None) -> None:
+    def _emit_rec_state(self, widget: Optional["ConsoleView"] = None) -> None:
         p = self._recorder.cast_path
         content = {
             "type": "rec-state",
@@ -803,10 +817,8 @@ class Session:
     def close(self) -> None:
         self.terminate()
         if not self._exited.wait(3):
-            try:
+            with log_exception_min:
                 self.kill()
-            except Exception:
-                pass
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -816,15 +828,13 @@ class Session:
             shutil.rmtree(tmp, ignore_errors=True)
 
     # -------------------------------------------------------------- widgets
-    def _send_to(self, widget, content: dict, buffers: list) -> None:
+    def _send_to(self, widget: Optional["ConsoleView"], content: Dict[str, Any], buffers: List[bytes]) -> None:
         if widget is None:
             return
 
         def _send() -> None:
-            try:
+            with log_exception_min:
                 widget.send(content, buffers=buffers)
-            except Exception:
-                pass
 
         loop = getattr(self._kernel, "io_loop", None)
         if loop is not None:
@@ -832,11 +842,11 @@ class Session:
         else:
             _send()
 
-    def _emit(self, content: dict, buffers: list) -> None:
-        for widget, _handle, _notes, _header in self._state.views_snapshot():
-            self._send_to(widget, content, buffers)
+    def _emit(self, content: Dict[str, Any], buffers: List[bytes]) -> None:
+        for view in self._state.views_snapshot():
+            self._send_to(view.widget, content, buffers)
 
-    def _new_view(self):
+    def _new_view(self) -> "ConsoleView":
         from .widget import ConsoleView
 
         widget = ConsoleView(session_name=self.name)
@@ -853,10 +863,10 @@ class Session:
             comm.on_close(lambda data, w=widget: self._prune_view(w))
         return widget
 
-    def _prune_view(self, widget) -> None:
+    def _prune_view(self, widget: "ConsoleView") -> None:
         self._state.prune_view(widget)
 
-    def _on_widget_msg(self, widget, content, buffers) -> None:
+    def _on_widget_msg(self, widget: "ConsoleView", content: Dict[str, Any], buffers: List[bytes]) -> None:
         kind = content.get("type")
         if kind == "ready":
             scrollback = self._state.dump_scrollback()
@@ -875,17 +885,13 @@ class Session:
         elif kind == "erase":
             self.erase()
         elif kind == "screenshot":
-            try:
+            with log_exception_min:
                 self._publish_note_to(widget, self._snapshot_text())
-            except Exception:
-                pass
         elif kind == "resize":
             rows, cols = int(content.get("rows", 24)), int(content.get("cols", 80))
             if (rows, cols) != (self._rows, self._cols):
-                try:
+                with log_exception_min:
                     self.resize(rows, cols)
-                except Exception:
-                    pass
 
     def _ipython_display_(self) -> None:
         """Embed a live console here. Every cell that displays the session
@@ -915,21 +921,19 @@ class Session:
         widget._text = self.text
         handle = display(widget, display_id=True)
         notes = display(self._transcript, display_id=True)
-        self._state.add_view((widget, handle, notes, self._capture_parent_header()))
+        self._state.add_view(View(widget, handle, notes, self._capture_parent_header()))
 
     @staticmethod
-    def _capture_parent_header() -> Optional[dict]:
-        try:
+    def _capture_parent_header() -> Optional[Dict[str, Any]]:
+        with log_exception_min:
             from IPython import get_ipython
 
             ip = get_ipython()
             if ip is not None:
                 return dict(ip.display_pub.parent_header)
-        except Exception:
-            pass
         return None
 
-    def _publish_note_to(self, widget, text: str) -> None:
+    def _publish_note_to(self, widget: "ConsoleView", text: str) -> None:
         """Publish ``text`` as a brand-new, separate output on just the ONE
         cell that displays ``widget`` (PLAN.md §6) — as if ``display()`` were
         called again — so a screenshot appears only where it was actually
@@ -944,16 +948,16 @@ class Session:
         attach to; it would land wherever the kernel happens to be, which by
         the time a real click arrives is usually some unrelated later cell."""
         header = None
-        for w, _handle, _notes, h in self._state.views_snapshot():
-            if w is widget:
-                header = h
+        for view in self._state.views_snapshot():
+            if view.widget is widget:
+                header = view.header
                 break
         if header is None:
             return
         mimebundle = Note(text)._repr_mimebundle_()
 
         def _publish() -> None:
-            try:
+            with log_exception_min:
                 from IPython import get_ipython
 
                 kernel = getattr(get_ipython(), "kernel", None)
@@ -962,8 +966,6 @@ class Session:
                 content = {"data": mimebundle, "metadata": {}, "transient": {}}
                 msg = kernel.session.msg("display_data", content, parent=header)
                 kernel.session.send(kernel.iopub_socket, msg, ident=b"display_data")
-            except Exception:
-                pass
 
         loop = getattr(self._kernel, "io_loop", None)
         if loop is not None:
@@ -995,7 +997,9 @@ class Session:
             self.sendline(f". '{path}'")
 
     def __repr__(self) -> str:
-        state = f"exited {self._returncode}" if self._exited.is_set() else ("busy" if self._state.active else "at prompt")
+        state = (
+            f"exited {self._returncode}" if self._exited.is_set() else ("busy" if self._state.active else "at prompt")
+        )
         return f"<quahog.Session {self.name} ({self.shell_kind}, pid {self.pid}, {state})>"
 
 
@@ -1004,7 +1008,7 @@ class Session:
 
 def _rcfile_bash(tmpdir: str, inherit_rc: bool) -> str:
     path = os.path.join(tmpdir, "bashrc")
-    lines = []
+    lines: List[str] = []
     if inherit_rc:
         lines.append('[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"')
     else:

@@ -24,13 +24,18 @@ from __future__ import annotations
 import codecs
 import datetime as _dt
 import json
+import logging
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
+from . import utils
 from .result import clean_text
+
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
 
 PLACEHOLDER = "[input suppressed]"
 TAIL_SECONDS = 3.0
@@ -39,7 +44,7 @@ TAIL_SECONDS = 3.0
 # ------------------------------------------------------------ sidecar folder
 def notebook_path() -> Optional[Path]:
     """Best-effort path of the notebook this kernel is serving."""
-    try:
+    with log_exception_min:
         from IPython import get_ipython
 
         ip = get_ipython()
@@ -47,8 +52,6 @@ def notebook_path() -> Optional[Path]:
             p = ip.user_ns.get("__vsc_ipynb_file__")
             if p:
                 return Path(p)
-    except Exception:
-        pass
     p = os.environ.get("JPY_SESSION_NAME", "")
     if p.endswith(".ipynb"):
         q = Path(p)
@@ -78,7 +81,7 @@ class CastWriter:
         self.path = Path(path)
         self._tail_seconds = tail_seconds
         self._t0 = time.time()
-        self._tail: List[list] = []  # [t, code, data] — mutable for erase
+        self._tail: List[List[Any]] = []  # [t, code, data] — mutable for erase
         self._lock = threading.RLock()
         self._timer: Optional[threading.Timer] = None
         self._closed = False
@@ -167,7 +170,7 @@ class EchoClassifier:
     def __init__(self, callback: Callable[[str], None]) -> None:
         self._cb = callback
         self._lock = threading.Lock()
-        self._pending: Optional[tuple] = None
+        self._pending: Optional[Tuple[float, str]] = None
         self._timer: Optional[threading.Timer] = None
 
     def input(self, text: str, unechoed: bool = False) -> None:
@@ -234,7 +237,7 @@ class Recorder:
     while not recording.
     """
 
-    def __init__(self, session_name: str, on_event: Optional[Callable] = None) -> None:
+    def __init__(self, session_name: str, on_event: Optional[Callable[..., None]] = None) -> None:
         self.session_name = session_name
         self._on_event = on_event or (lambda kind, **kw: None)
         self._writer: Optional[CastWriter] = None

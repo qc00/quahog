@@ -1,38 +1,51 @@
-"""Interceptor API (PLAN.md §6): plugins that match known commands and act
-around them.
+import logging
+from typing import Any, Dict, List, Optional, Protocol, TYPE_CHECKING
 
-An interceptor is any object with::
+from .. import utils
 
-    match(argv, session) -> bool      # required: does this command concern me?
-    before(ctx)                       # optional: the command is starting
-    on_output(ctx, text)              # optional: an output chunk during the command
-    on_input(ctx, data)               # optional: keystrokes during the command
-    after(ctx) -> str | None          # optional: command finished; a returned
-                                      # string is appended to the command's
-                                      # cell output (e.g. a vim diff)
+if TYPE_CHECKING:
+    from importlib.metadata import EntryPoint
 
-``ctx`` exposes the same recorder controls as the widget toolbar — and that is
-the whole password story: a password interceptor is just a hook that suppresses
-input recording, released in ``after()`` or when the prompt is answered. There
-is no dedicated password API.
+    from ..session import Session
 
-Third-party interceptors ship via the ``quahog.interceptors`` entry-point group
-(a class or an instance); ``register()`` adds one for this kernel's lifetime.
-"""
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
 
-from __future__ import annotations
 
-from typing import Any, List, Optional
+class Interceptor(Protocol):
+    """Interceptor API (PLAN.md §6): plugins that match known commands and act
+    around them.
+
+    An interceptor is any object with::
+
+        match(argv, session) -> bool      # required: does this command concern me?
+        before(ctx)                       # optional: the command is starting
+        on_output(ctx, text)              # optional: an output chunk during the command
+        on_input(ctx, data)               # optional: keystrokes during the command
+        after(ctx) -> str | None          # optional: command finished; a returned
+                                        # string is appended to the command's
+                                        # cell output (e.g. a vim diff)
+
+    ``ctx`` exposes the same recorder controls as the widget toolbar — and that is
+    the whole password story: a password interceptor is just a hook that suppresses
+    input recording, released in ``after()`` or when the prompt is answered. There
+    is no dedicated password API.
+
+    Third-party interceptors ship via the ``quahog.interceptors`` entry-point group
+    (a class or an instance); ``register()`` adds one for this kernel's lifetime.
+    """
+
+    def match(self, argv: List[str], session: "Session") -> bool: ...
 
 
 class Ctx:
     """Per-command context handed to every hook of a matched interceptor."""
 
-    def __init__(self, session, argv: List[str], command: str) -> None:
+    def __init__(self, session: "Session", argv: List[str], command: str) -> None:
         self.session = session
         self.argv = list(argv)
         self.command = command
-        self.state: dict = {}
+        self.state: Dict[str, Any] = {}
         self._holds = 0
 
     # -- recorder controls (the same surface as the toolbar) ---------------
@@ -58,10 +71,10 @@ class Ctx:
             self.release_input()
 
 
-_registry: Optional[List[Any]] = None
+_registry: Optional[List[Interceptor]] = None
 
 
-def all_interceptors() -> List[Any]:
+def all_interceptors() -> List[Interceptor]:
     """Shipped interceptors plus everything on the entry-point group."""
     global _registry
     if _registry is None:
@@ -69,24 +82,23 @@ def all_interceptors() -> List[Any]:
 
         _registry = [cls() for cls in BUILTINS]
         for ep in _entry_points():
-            try:
+            with log_exception_min:
                 obj = ep.load()
                 _registry.append(obj() if isinstance(obj, type) else obj)
-            except Exception:
-                continue
     return _registry
 
 
-def register(interceptor: Any) -> None:
+def register(interceptor: Interceptor) -> None:
     """Add an interceptor for this kernel's lifetime (entry points are the
     durable mechanism)."""
     all_interceptors().append(interceptor)
 
 
-def _entry_points():
+def _entry_points() -> List["EntryPoint"]:
     try:
         from importlib.metadata import entry_points
 
         return list(entry_points(group="quahog.interceptors"))
     except Exception:
+        log_exception_min()
         return []

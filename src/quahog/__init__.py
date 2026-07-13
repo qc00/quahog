@@ -1,16 +1,18 @@
 """quahog — interactive console sessions, captured in Jupyter notebooks.
 
-    import quahog as q
-    h = q.bash()          # spawn; display(h) embeds the live console
-    r = h.run("ls -la")   # programmatic command; r.text / r.raw / r.returncode
-    %qua make test        # magic sugar over run() on the default session
+import quahog as q
+h = q.bash()          # spawn; display(h) embeds the live console
+r = h.run("ls -la")   # programmatic command; r.text / r.raw / r.returncode
+%qua make test        # magic sugar over run() on the default session
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+from typing import Any, Dict, Optional
 
 from . import interceptors  # noqa: F401
+from . import utils
 from .fork import ForkHandle  # noqa: F401
 from .minutes import Note  # noqa: F401
 from .result import CommandResult, MultiResult, clean_text  # noqa: F401
@@ -22,6 +24,9 @@ from .session import (  # noqa: F401
     spawn_bash,
     spawn_zsh,
 )
+
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
 
 __version__ = "0.4.0"
 __all__ = [
@@ -44,7 +49,7 @@ __all__ = [
 class _Registry(dict):
     """Name -> Session. Shown as a small table in notebooks."""
 
-    def _repr_mimebundle_(self, include=None, exclude=None):
+    def _repr_mimebundle_(self, include: Any = None, exclude: Any = None) -> Dict[str, str]:
         lines = [f"{name}: {s!r}" for name, s in self.items()] or ["(no sessions)"]
         return {"text/plain": "\n".join(lines)}
 
@@ -69,45 +74,39 @@ def _next_name(base: str) -> str:
 
 def bash(
     cwd: Optional[str] = None,
-    env: Optional[dict] = None,
+    env: Optional[Dict[str, str]] = None,
     name: Optional[str] = None,
     inherit_rc: bool = True,
     record: bool = False,
 ) -> Session:
     """Spawn a local interactive bash with quahog shell integration."""
-    return _register(
-        spawn_bash(name or _next_name("bash"), cwd=cwd, env=env, inherit_rc=inherit_rc, record=record)
-    )
+    return _register(spawn_bash(name or _next_name("bash"), cwd=cwd, env=env, inherit_rc=inherit_rc, record=record))
 
 
 def zsh(
     cwd: Optional[str] = None,
-    env: Optional[dict] = None,
+    env: Optional[Dict[str, str]] = None,
     name: Optional[str] = None,
     inherit_rc: bool = True,
     record: bool = False,
 ) -> Session:
     """Spawn a local interactive zsh with quahog shell integration."""
-    return _register(
-        spawn_zsh(name or _next_name("zsh"), cwd=cwd, env=env, inherit_rc=inherit_rc, record=record)
-    )
+    return _register(spawn_zsh(name or _next_name("zsh"), cwd=cwd, env=env, inherit_rc=inherit_rc, record=record))
 
 
-def load_ipython_extension(ip) -> None:
+def load_ipython_extension(ip: Any) -> None:
     from .magics import load_ipython_extension as _load
 
     _load(ip)
 
 
 def _auto_register_magics() -> None:
-    try:
+    with log_exception_min:
         from IPython import get_ipython
 
         ip = get_ipython()
         if ip is not None:
             load_ipython_extension(ip)
-    except Exception:
-        pass
 
 
 _auto_register_magics()

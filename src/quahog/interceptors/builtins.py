@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import difflib
+import logging
 import os
 import re
 from pathlib import Path
+from typing import List, Optional, TYPE_CHECKING, Union
+
+from .. import utils
+from . import Ctx
+
+if TYPE_CHECKING:
+    from ..session import Session
+
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
 
 
 def _base(argv0: str) -> str:
@@ -23,15 +34,15 @@ class EditorDiffInterceptor:
 
     EDITORS = {"vim", "vi", "nvim", "nano"}
 
-    def match(self, argv, session) -> bool:
+    def match(self, argv: List[str], session: "Session") -> bool:
         return _base(argv[0]) in self.EDITORS and self._target(argv) is not None
 
-    def before(self, ctx) -> None:
+    def before(self, ctx: Ctx) -> None:
         path = self._resolve(ctx)
         ctx.state["path"] = path
         ctx.state["before"] = self._read(path)
 
-    def after(self, ctx):
+    def after(self, ctx: Ctx) -> Optional[str]:
         path = ctx.state.get("path")
         if path is None:
             return None
@@ -49,13 +60,13 @@ class EditorDiffInterceptor:
         return "\n".join(diff)
 
     @staticmethod
-    def _target(argv):
+    def _target(argv: List[str]) -> Optional[str]:
         for arg in reversed(argv[1:]):
             if not arg.startswith("-") and not arg.startswith("+"):
                 return arg
         return None
 
-    def _resolve(self, ctx) -> Path:
+    def _resolve(self, ctx: Ctx) -> Path:
         p = Path(os.path.expanduser(self._target(ctx.argv)))
         if not p.is_absolute():
             p = Path(ctx.session.cwd or os.getcwd()) / p
@@ -66,6 +77,7 @@ class EditorDiffInterceptor:
         try:
             return path.read_text(errors="replace")
         except OSError:
+            log_exception_min()
             return ""  # not there yet — a freshly created file diffs from ""
 
 
@@ -75,10 +87,10 @@ class PagerInterceptor:
 
     PAGERS = {"less", "man", "more"}
 
-    def match(self, argv, session) -> bool:
+    def match(self, argv: List[str], session: "Session") -> bool:
         return _base(argv[0]) in self.PAGERS
 
-    def after(self, ctx):
+    def after(self, ctx: Ctx) -> None:
         return None
 
 
@@ -94,19 +106,18 @@ class PasswordInterceptor:
 
     COMMANDS = {"sudo", "su", "ssh", "passwd"}
     PROMPT_RE = re.compile(
-        r"(?:password|passphrase|pin|passwort|mot de passe|contraseña|senha|密码|パスワード)"
-        r"[^\n]{0,60}[::]\s*$",
+        r"(?:password|passphrase|pin|passwort|mot de passe|contraseña|senha|密码|パスワード)" r"[^\n]{0,60}[::]\s*$",
         re.IGNORECASE,
     )
 
-    def match(self, argv, session) -> bool:
+    def match(self, argv: List[str], session: "Session") -> bool:
         return _base(argv[0]) in self.COMMANDS
 
-    def before(self, ctx) -> None:
+    def before(self, ctx: Ctx) -> None:
         ctx.state["tail"] = ""
         ctx.state["armed"] = False
 
-    def on_output(self, ctx, text: str) -> None:
+    def on_output(self, ctx: Ctx, text: str) -> None:
         from ..result import clean_text
 
         tail = (ctx.state.get("tail", "") + clean_text(text))[-256:]
@@ -115,7 +126,7 @@ class PasswordInterceptor:
             ctx.suppress_input()
             ctx.state["armed"] = True
 
-    def on_input(self, ctx, data) -> None:
+    def on_input(self, ctx: Ctx, data: Union[bytes, str]) -> None:
         if isinstance(data, str):
             data = data.encode()
         if ctx.state.get("armed") and (b"\r" in data or b"\n" in data):
@@ -125,11 +136,11 @@ class PasswordInterceptor:
             ctx.state["armed"] = False
             ctx.state["tail"] = ""
 
-    def after(self, ctx):
+    def after(self, ctx: Ctx) -> None:
         if ctx.state.get("armed"):
             ctx.release_input()
             ctx.state["armed"] = False
         return None
 
 
-BUILTINS = [EditorDiffInterceptor, PagerInterceptor, PasswordInterceptor]
+BUILTINS: List[type] = [EditorDiffInterceptor, PagerInterceptor, PasswordInterceptor]

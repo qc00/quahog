@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import threading
 import time
-from typing import List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 # CSI sequences, other single-ESC sequences, and C0 controls except \n, \t, \r.
 _STRIP_RE = re.compile(
@@ -114,7 +114,9 @@ class CommandResult:
         parts.extend(self.notes)
         return "\n".join(parts)
 
-    def _repr_mimebundle_(self, include=None, exclude=None):
+    def _repr_mimebundle_(
+        self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
+    ) -> Dict[str, Any]:
         return {
             "text/plain": self._plain(),
             "application/vnd.quahog.output+json": {
@@ -138,17 +140,19 @@ class MultiResult:
     def __init__(self, results: List[CommandResult]) -> None:
         self.results = results
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[CommandResult]:
         return iter(self.results)
 
-    def __getitem__(self, i):
+    def __getitem__(self, i: int) -> CommandResult:
         return self.results[i]
 
     @property
     def ok(self) -> bool:
         return all(r.ok for r in self.results)
 
-    def _repr_mimebundle_(self, include=None, exclude=None):
+    def _repr_mimebundle_(
+        self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
+    ) -> Dict[str, Any]:
         return {
             "text/plain": "\n".join(r._plain() for r in self.results),
             "application/vnd.quahog.output+json": [

@@ -17,8 +17,14 @@ it for the app to draw on; leaving restores exactly what was stashed.
 from __future__ import annotations
 
 import copy
+import logging
 import re
-from typing import Optional
+from typing import Any, Optional
+
+from . import utils
+
+logger = logging.getLogger(__name__)
+log_exception_min = utils.LogExceptionMinimal(logger.debug)
 
 # Longest sequence is 8 bytes; the carry keeps a suffix of the previous chunk
 # so a switch split across reads is still seen. Re-scanning the carried suffix
@@ -37,15 +43,13 @@ class ScreenMirror:
         self._stream = pyte.ByteStream(self._screen)
         self._carry = b""
         self.altscreen = False
-        self._saved_buffer = None
-        self._saved_cursor = None
+        self._saved_buffer: Optional[Any] = None
+        self._saved_cursor: Optional[Any] = None
 
     def feed(self, data: bytes) -> Optional[bool]:
         """Ingest PTY output; returns the new alt-screen state if it changed."""
-        try:
+        with log_exception_min:  # pyte hiccups must never kill the tap
             self._stream.feed(data)
-        except Exception:
-            pass  # pyte hiccups must never kill the tap
         buf = self._carry + data
         self._carry = buf[-_CARRY:]
         state = self.altscreen
@@ -58,7 +62,7 @@ class ScreenMirror:
         return None
 
     def _swap_buffer(self, entering_altscreen: bool) -> None:
-        try:
+        with log_exception_min:  # a mirror hiccup must never kill the tap
             if entering_altscreen:
                 self._saved_buffer = copy.deepcopy(self._screen.buffer)
                 self._saved_cursor = copy.copy(self._screen.cursor)
@@ -70,14 +74,10 @@ class ScreenMirror:
                 self._screen.cursor = self._saved_cursor
                 self._saved_buffer = None
                 self._saved_cursor = None
-        except Exception:
-            pass  # a mirror hiccup must never kill the tap
 
     def resize(self, rows: int, cols: int) -> None:
-        try:
+        with log_exception_min:
             self._screen.resize(rows, cols)
-        except Exception:
-            pass
 
     def snapshot(self) -> str:
         """The current screen as plain text, trailing blanks trimmed."""
