@@ -382,7 +382,84 @@ WSL is a first-class initial shell: Windows-side PTY, POSIX-side integration.
 
 ---
 
-## 9. Repository layout
+## 9. MCP server — agent-driven sessions and notebook edits
+
+An external AI agent (Claude, etc.) can drive quahog over the **Model Context Protocol**, the
+same way a human does: see what's on a session, run a command, toggle recording, and edit or
+execute notebook cells. Built on **fastmcp** (already a dependency for this milestone).
+
+**Design principle — cells are the API for anything that must bind a variable.** The server
+deliberately does *not* wrap `exec()`/`fork()`/`display()`/session construction. Instead the
+agent writes a cell (`r = h.exec("make test")`) and executes it, so `r` lands in the kernel
+namespace and is available to every later cell — exactly the human workflow, and it keeps the
+notebook the honest record of what happened. The server's own verbs cover only what *isn't*
+naturally a cell: session introspection, a convenience `run`, recording, cell CRUD, and
+snapshot. This keeps the tool surface tiny and gives the agent no authority the notebook itself
+doesn't already show.
+
+### Where it runs — the bridge
+
+The server is a **jupyter-server extension**, so it shares the one process that already owns
+both halves it has to touch:
+
+- **Kernel side** — sessions live in the kernel. `list_sessions`/`read_session`/`run`/`record`
+  reach `quahog.sessions` over the server's existing kernel channels; there is no second copy of
+  session state.
+- **Document side** — cells live in the notebook document. Cell tools mutate it through
+  jupyter-server's notebook model, keyed by the nbformat **cell `id`** (stable since nbformat
+  4.5). When **jupyter-collaboration** (RTC / ydoc) is installed, edits go through the shared
+  model and show up live in every open frontend; without it, they go through the file model plus
+  a save, then an execute request.
+
+Transport: a streamable-HTTP endpoint the extension mounts, plus a stdio launcher
+(`python -m quahog.mcp`) for clients that prefer a subprocess. A **kernel-only fallback** (no
+jupyter-server present) still offers the session tools; cell CRUD there degrades to
+`set_next_input`-style append, since the kernel alone can't delete or reorder document cells.
+
+### Tools
+
+**Session (kernel side):**
+
+- `list_sessions()` → for each: `name`, `shell`, `cwd`, `pid`, `returncode`, `altscreen`,
+  `recording`, and the ids of the cells currently displaying it.
+- `read_session(name, kind="text", tail=None)` → `text` (clean accumulated output) / `raw`
+  (with escapes) / `screen` (pyte snapshot of what's on screen right now) / `minutes` (the typed
+  command log). The cheap "read once, see state" call.
+- `run(session, command, timeout=None)` → types `command`, captures its output between the OSC
+  133 markers, returns `{returncode, text}`. Same launch-and-capture core as `%qua` / `h.run()`;
+  refuses during alt-screen, exactly like `run()`.
+- `record(session, on=True)` → toggle keystroke recording (§6).
+
+**Notebook cells (document side).** The agent learns the ids by reading the `.ipynb` once (it
+already has the file); these tools then act on the *live* document:
+
+- `read_cell(cell_id)` → live source + rendered outputs (can be fresher than the on-disk file).
+- `write_cell(cell_id, source)` → replace the source; does not execute.
+- `execute_cell(cell_id)` → run it on the notebook's kernel; returns outputs / error.
+- `delete_cell(cell_id)`.
+- `insert_cell(source, before=cell_id | after=cell_id, execute=False)` → returns the new id.
+
+**Snapshot:**
+
+- `snapshot(cell_id)` — the one tool that **references a cell already displaying a console**. It
+  targets the session view rendered *in that cell* and dumps the current screen into *that
+  cell's* output, exactly like the toolbar camera button (per-view, so it never lands under a
+  different cell that happens to show the same session — §4/§6). Mechanism: the cell's output
+  carries the ipywidgets **model id** of the `ConsoleView` displayed there; the document side
+  reads it, the kernel side matches it to the live view, and that view's screenshot is published
+  onto that cell. Errors if the cell holds no live console.
+
+### Safety
+
+Read/introspection tools carry `readOnlyHint`; `run`, `execute_cell`, `write_cell`,
+`delete_cell`, `insert_cell` do not. Everything runs with the notebook owner's own kernel
+privileges and inherits jupyter-server's authentication — the server grants no authority beyond
+MCP-client access, and there is no arbitrary-`eval` verb: the only way the agent runs Python is
+by writing a cell it (and the human) can see.
+
+---
+
+## 10. Repository layout
 
 ```
 quahog/
@@ -403,6 +480,8 @@ quahog/
     copy.py                 # quahog cat/tar upload (length-framed) + download (base64) + box
     fork.py                 # fork(): ForkSession over a local FIFO trio (local sessions only)
     interceptors/           # interceptor API + vim/nano/password built-ins
+    mcp.py                  # fastmcp server (§9): tool defs + kernel/document bridge;
+                            #   optional (quahog[mcp]); `python -m quahog.mcp` stdio launcher
     widget/                 # anywidget ESM bundle (xterm.js vendored at build time), CSS
   js/                       # bundle sources; esbuild; npm is dev-only, output committed/shipped
   tests/                    # pytest; PTY integration tests against real bash
@@ -411,7 +490,7 @@ quahog/
 
 ---
 
-## 10. Milestones
+## 11. Milestones
 
 1. **MVP (local bash):** Session + unix PTY, xterm.js embed with resize, OSC 133 inject/parse,
    async `run()` / awaitable `CommandResult` (`.raw`/`.text`), `%qua`/`%%qua` magics, the
@@ -429,12 +508,18 @@ quahog/
    support, `mirror`); local `fork()`/`ForkSession` over a FIFO trio (separate streams;
    remote fork over a tmux pane deferred to a later release); `quahog cat`/`quahog tar`/`quahog
    download` copy. (Managed ssh and hop chaining has been descoped.)
-5. **Pop-out extras & Windows:** terminal-app launch + telnet attach server; pywinpty backend,
+5. **MCP server (agent-driven):** fastmcp server as a jupyter-server extension (§9); session
+   tools (`list_sessions`/`read_session`/`run`/`record`), notebook-cell CRUD + execute by id,
+   `insert_cell` before/after, `snapshot(cell_id)` targeting a cell's live view; the
+   cells-as-variables workflow (`exec`/`fork` run by writing and executing cells). *Exit
+   criterion: an MCP client lists a session, runs a command, writes+executes a cell that binds a
+   variable, and snapshots a console cell.*
+6. **Pop-out extras & Windows:** terminal-app launch + telnet attach server; pywinpty backend,
    PowerShell integration, WSL, cmd.exe subset.
 
 ---
 
-## 11. Risks & open questions
+## 12. Risks & open questions
 
 - **VS Code behavior is the linchpin of §5** — verify early (milestone 2 gate): `set_next_input`
   payload handling (multiple queued payloads per execution vs. one batched `%%qua` cell) and
@@ -454,5 +539,10 @@ quahog/
   launch-and-capture core and waiting on the completion event synchronously. Confirm a blocking
   `%qua` doesn't starve *other* sessions' live views for longer than acceptable — if it does,
   the fallback is async magics (verify IPython/ipykernel coroutine-magic support first).
+- **MCP cell CRUD depends on the document model (§9):** true insert/delete/execute-by-id needs
+  jupyter-server, ideally jupyter-collaboration/ydoc — the kernel alone can only append via
+  `set_next_input`. Verify ydoc cell-`id` stability across edits, that edits round-trip to disk,
+  and that the cell's output really exposes the `ConsoleView` model id `snapshot` needs;
+  document the degraded kernel-only mode.
 - **cmd.exe** stays capped by design; PowerShell/WSL are the real Windows targets.
 - Name availability re-verified at registration time; `quahog` free on PyPI as of 2026-07-10.

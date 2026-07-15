@@ -22,6 +22,7 @@ classifiers = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "pytest-timeout>=2", "jupyterlab>=4"]
+mcp = ["fastmcp>=3", "jupyter-server>=2"]
 
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
