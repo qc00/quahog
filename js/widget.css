@@ -28,10 +28,31 @@
 }
 
 .qua-title {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The app's own OSC 0/1/2 name. Takes the bar's slack so the tools stay put
+   whether or not anything set a title. */
+.qua-osc-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #6d7385;
+}
+
+.qua-osc-title::before {
+  content: "·";
+  margin-right: 6px;
+}
+
+/* Untitled: the span still absorbs the slack, but shows nothing at all. */
+.qua-osc-title:empty::before {
+  content: none;
 }
 
 .qua-tools {
@@ -89,6 +110,13 @@
   padding: 0 5px;
   font-size: 10px;
   white-space: nowrap;
+}
+
+/* stdin gone for good (the session exited), as opposed to merely on loan to a
+   foreground exec. */
+.qua-badge.qua-badge-off {
+  background: #4a2f33;
+  color: #e06c75;
 }
 
 @keyframes qua-flash {

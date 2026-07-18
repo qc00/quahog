@@ -322,8 +322,7 @@ class Session:
                         # Foreground exec: the shell is back at its prompt, so
                         # the session is free and es.wait() can complete now
                         # (rc already set by the X tag).
-                        if st.fg_exec == ex.eid:
-                            st.fg_exec = None
+                        self._clear_fg_exec(ex.eid)
                         ex._done.set()
                     self._refresh_views()
                 elif st.icap is not None:
@@ -369,8 +368,7 @@ class Session:
                     es.returncode = int(rcs) if rcs.lstrip("-").isdigit() else None
                     if es.background:
                         es._done.set()
-                        if st.fg_exec == eid:
-                            st.fg_exec = None
+                        self._clear_fg_exec(eid)
             elif kind == "U":
                 # upload request (local -> remote): kernel streams the bytes.
                 mode, _, path = rest.partition(";")
@@ -613,6 +611,7 @@ class Session:
         self._at_prompt.set()  # unblock anyone waiting on a dead shell
         self._recorder.close()
         self._emit({"type": "exited", "code": self._returncode}, [])
+        self._emit_stdin_state()
 
     # ------------------------------------------------------------- commands
     def run(
@@ -766,6 +765,8 @@ class Session:
             # to its prompt; wait for that so the handle is returned only when
             # the session is free again (the orphaned job keeps streaming O/X).
             self._at_prompt.wait(self._PROMPT_WAIT)
+        else:
+            self._emit_stdin_state()  # stdin is the exec's until its prompt returns
         return es
 
     # ------------------------------------------------------------ copy (§7)
@@ -1029,6 +1030,29 @@ class Session:
         else:
             self._emit(content, [])
 
+    def _emit_stdin_state(self, widget: Optional["ConsoleView"] = None) -> None:
+        """Tell views whether what they type still reaches the shell: the
+        session has exited (the PTY is gone, keystrokes are dropped), or a
+        foreground exec owns stdin (PLAN.md §3) — typing there feeds the exec,
+        not the shell, since exec rides this same PTY."""
+        if self._exited.is_set():
+            state = "closed"
+        elif self._state.fg_exec is not None:
+            state = "exec"
+        else:
+            state = "open"
+        content = {"type": "stdin-state", "state": state}
+        if widget is not None:
+            self._send_to(widget, content, [])
+        else:
+            self._emit(content, [])
+
+    def _clear_fg_exec(self, eid: str) -> None:
+        """Release stdin if ``eid`` is the exec holding it, telling the views."""
+        if self._state.fg_exec == eid:
+            self._state.fg_exec = None
+            self._emit_stdin_state()
+
     def close(self) -> None:
         self.terminate()
         if not self._exited.wait(3):
@@ -1088,6 +1112,7 @@ class Session:
             if scrollback:
                 self._send_to(widget, {"type": "out"}, [scrollback])
             self._emit_rec_state(widget)
+            self._emit_stdin_state(widget)
             if self.altscreen:
                 self._send_to(widget, {"type": "altscreen", "on": True}, [])
             if self._exited.is_set():

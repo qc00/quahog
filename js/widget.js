@@ -23,18 +23,46 @@ function render({ model, el }) {
   const title = document.createElement("span");
   title.className = "qua-title";
   title.textContent = model.get("session_name") || "session";
+  // What the shell/app calls itself (OSC 0/2 window title), next to the
+  // session name we gave it (PLAN.md §2). No icon (OSC 0/1): there's nothing
+  // here to iconify/minimize, so an icon name has nowhere to show.
+  const osc = document.createElement("span");
+  osc.className = "qua-osc-title";
   const badge = document.createElement("span");
   badge.className = "qua-badge";
   badge.textContent = "full-screen";
   badge.style.display = "none";
+  const stdinBadge = document.createElement("span");
+  stdinBadge.className = "qua-badge qua-stdin";
+  stdinBadge.style.display = "none";
   const tools = document.createElement("span");
   tools.className = "qua-tools";
   const size = document.createElement("span");
   size.className = "qua-size";
   bar.appendChild(title);
+  bar.appendChild(osc);
   bar.appendChild(badge);
+  bar.appendChild(stdinBadge);
   bar.appendChild(tools);
   bar.appendChild(size);
+
+  // Whether typing here still reaches the shell (kernel-classified, since only
+  // it knows about exit and foreground execs): "closed" -- the session exited,
+  // keystrokes go nowhere; "exec" -- a foreground exec owns stdin, so what you
+  // type feeds the command rather than the shell. Same label either way; the
+  // tooltip (and, for "closed", the tint) is what tells them apart.
+  function renderStdin(state) {
+    const shown = state === "closed" || state === "exec";
+    stdinBadge.textContent = "Input disabled";
+    stdinBadge.title =
+      state === "closed"
+        ? "the session has exited; keystrokes are ignored"
+        : state === "exec"
+          ? "a foreground exec owns stdin; typing feeds the command, not the shell"
+          : "";
+    stdinBadge.style.display = shown ? "" : "none";
+    stdinBadge.classList.toggle("qua-badge-off", state === "closed");
+  }
 
   const body = document.createElement("div");
   body.className = "qua-body";
@@ -103,6 +131,13 @@ function render({ model, el }) {
   term.loadAddon(fit);
   term.open(body);
 
+  // OSC 0/2 (xterm.js fires onTitleChange for both). Left empty rather than
+  // hidden when there's no title: the span is also the bar's spacer, and
+  // .qua-osc-title:empty drops its separator so nothing shows.
+  term.onTitleChange((t) => {
+    osc.textContent = t;
+  });
+
   let exited = false;
 
   term.onData((d) => {
@@ -148,6 +183,8 @@ function render({ model, el }) {
     } else if (msg.type === "echo") {
       // Un-echoed or masked keystroke while recording: prompt with ⌫.
       flash(eraseBtn);
+    } else if (msg.type === "stdin-state") {
+      renderStdin(msg.state);
     } else if (msg.type === "altscreen") {
       badge.style.display = msg.on ? "" : "none";
       camBtn.classList.toggle("qua-hot", !!msg.on);

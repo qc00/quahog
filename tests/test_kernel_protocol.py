@@ -13,6 +13,7 @@ These tests assert on those wire messages via jupyter_client — stronger than a
 pixel test, and it is the same surface VS Code consumes.
 """
 
+import shutil
 import sys
 import time
 
@@ -85,6 +86,52 @@ def _notes_displays(displays):
         if "application/vnd.jupyter.widget-view+json" not in m["content"]["data"]
         and m["content"].get("transient", {}).get("display_id")
     ]
+
+
+def _stdin_states(iopub):
+    """The stdin-state widget messages, in order: what the toolbar's badge is
+    driven by (PLAN.md §3)."""
+    states = []
+    for m in iopub:
+        if m["msg_type"] != "comm_msg":
+            continue
+        content = m["content"].get("data", {}).get("content") or {}
+        if content.get("type") == "stdin-state":
+            states.append(content.get("state"))
+    return states
+
+
+def test_stdin_state_wire_protocol(kernel):
+    """The toolbar indicates when typing no longer reaches the shell. The
+    frontend can't work this out for itself — exit and foreground-exec stdin
+    ownership are both kernel-side facts — so it is pushed as its own message
+    on every transition, and answered on a new view's ready handshake."""
+    kc = kernel
+    execute(
+        kc,
+        "import shutil, time\nimport quahog as q\ns = q.bash(inherit_rc=False)\ns._ipython_display_()\n",
+        settle=0.5,
+    )
+
+    # A view attaching mid-session is told the current state, not left blank.
+    _, iopub = execute(
+        kc,
+        "w = s._state.views[-1][0]\ns._on_widget_msg(w, {'type': 'ready'}, [])\ntime.sleep(0.3)\n",
+        settle=0.5,
+    )
+    assert _stdin_states(iopub) == ["open"]
+
+    if shutil.which("socat") and shutil.which("perl"):
+        # A foreground exec borrows stdin: what you type feeds the command.
+        _, iopub = execute(kc, "es = s.exec('read x; echo got:$x')\ntime.sleep(0.3)\n", settle=0.5)
+        assert _stdin_states(iopub) == ["exec"]
+        # ...and hands it back once the shell is at its prompt again.
+        _, iopub = execute(kc, "es.stdin.write('typed\\n')\nes.wait(15)\ntime.sleep(0.3)\n", settle=1.0)
+        assert _stdin_states(iopub)[-1] == "open"
+
+    # Exit closes stdin for good.
+    _, iopub = execute(kc, "s.close()\ntime.sleep(0.3)\n", settle=1.0)
+    assert _stdin_states(iopub)[-1] == "closed"
 
 
 def test_minuting_wire_protocol(kernel):
