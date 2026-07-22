@@ -66,8 +66,7 @@ class Transcript:
         self, include: Optional[Iterable[str]] = None, exclude: Optional[Iterable[str]] = None
     ) -> Dict[str, Any]:
         bundle = {"text/plain": self._plain()}
-        # A block may offer richer HTML (a download box's data-URI link); if any
-        # does, surface it so Lab/NB7 render the link rather than plain text.
+        # A block may offer richer HTML:
         html = [b._html() for b in self.blocks if hasattr(b, "_html")]
         if html:
             bundle["text/html"] = "<br>".join(html)

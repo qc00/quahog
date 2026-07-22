@@ -94,13 +94,6 @@ class SessionState:
         self.iactive: List["ActiveInterceptor"] = []  # for the running command
 
         self.execs: Dict[str, "ExecSession"] = {}
-        self.fg_exec: Optional[str] = None
-
-        # In-progress "quahog download" (PLAN.md §7): dl_active gates the base64
-        # payload between its Ds/De markers away from the console text.
-        self.dl_active: bool = False
-        self.dl_name: Optional[str] = None
-        self.dl_parts: List[str] = []
 
         self.minutes: List["Minute"] = []
         self.views: List["View"] = []

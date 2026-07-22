@@ -102,20 +102,20 @@ class ForkSession:
 
     # ------------------------------------------------------------- streams
     @property
-    def stdout_bytes(self) -> bytes:
+    def stdout_raw(self) -> bytes:
         return bytes(self._out.buf)
 
     @property
-    def stderr_bytes(self) -> bytes:
+    def stderr_raw(self) -> bytes:
         return bytes(self._err.buf)
 
     @property
     def stdout(self) -> str:
-        return self.stdout_bytes.decode("utf-8", "replace")
+        return self.stdout_raw.decode("utf-8", "replace")
 
     @property
     def stderr(self) -> str:
-        return self.stderr_bytes.decode("utf-8", "replace")
+        return self.stderr_raw.decode("utf-8", "replace")
 
     def _tee(self, chunk: bytes) -> None:
         with self._cast_lock:

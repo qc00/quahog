@@ -112,9 +112,7 @@
   white-space: nowrap;
 }
 
-/* stdin gone for good (the session exited), as opposed to merely on loan to a
-   foreground exec. */
-.qua-badge.qua-badge-off {
+.qua-badge.qua-stdin-closed {
   background: #4a2f33;
   color: #e06c75;
 }

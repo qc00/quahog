@@ -8,6 +8,7 @@ CommandResult text; the widget is a pure client-side view.
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
 import itertools
 import logging
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, TYPE_CHECKING, Union
 
 from . import copy as _copy
+from . import injection
 from . import interceptors as _interceptors
 from . import utils
 from .fork import ForkSession
@@ -95,9 +97,6 @@ class View(NamedTuple):
     header: Optional[Dict[str, Any]]
 
 
-_INJECT_DIR = Path(__file__).parent / "inject"
-
-
 class TimeoutExpired(TimeoutError):
     """run(timeout=...) expired. The command keeps running; the partial
     CommandResult is available as .result and will complete in the background."""
@@ -127,7 +126,6 @@ class _Stdin:
             self._s = session
 
         def write(self, data: bytes, record: bool = True) -> int:
-            self._s._check_fg_exec()
             self._s._input(data, record=record)
             return len(data)
 
@@ -139,7 +137,6 @@ class _Stdin:
         self.raw = _Stdin._Raw(session)
 
     def write(self, data: str, record: bool = True) -> int:
-        self._s._check_fg_exec()
         self._s._input(data.encode(), record=record)
         return len(data)
 
@@ -151,12 +148,14 @@ class Session:
     """One live shell in a PTY. Popen vocabulary plus run()/display."""
 
     _PROMPT_WAIT = 10.0
+    _PLUMBING_CHUNK = 512
+    _PLUMBING_PAUSE = 0.02
+    _DEFAULT_ENV: Dict[str, str] = {}
 
     def __init__(
         self,
         argv: List[str],
         name: str,
-        shell_kind: str = "bash",
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         record: bool = False,
@@ -166,7 +165,6 @@ class Session:
         from ptyprocess import PtyProcess
 
         self.name = name
-        self.shell_kind = shell_kind
         full_env = dict(os.environ)
         full_env.update(
             TERM="xterm-256color", QUAHOG="1", QUAHOG_SESSION=name, LANG=full_env.get("LANG", "en_US.UTF-8")
@@ -192,11 +190,14 @@ class Session:
         # kernel thread, so they live on the façade, not in the shared state.
         self.minuting = True
         self.last_dump = 0
+        # Set to the probe's shell kind (True=zsh, False=bash) once OSC
+        # 2607;QUA;P arrives; the reader loop hands it to a worker thread and
+        # clears it back to None.
+        self._needs_hooks: Optional[bool] = None
+        self._last_output_at = time.monotonic()
 
-        # exec()/copy (PLAN.md §3, §7): a per-session id source for exec tags,
-        # and the list of completed remote->local downloads.
+        # exec() (PLAN.md §3): a per-session id source for exec tags.
         self._exec_ids: Iterator[int] = itertools.count(1)
-        self.downloads: List[_copy.DownloadBox] = []
 
         # The pyte mirror needs pyte, which may be absent (sessions still
         # work, screenshots don't).
@@ -210,6 +211,8 @@ class Session:
 
         self._reader = threading.Thread(target=self._read_loop, name=f"quahog-{name}", daemon=True)
         self._reader.start()
+        # A plain login shell carries no integration until this lands.
+        injection.inject(self)
         # Wait for the first prompt marker so run() right after construction
         # doesn't race shell startup.
         self._at_prompt.wait(self._PROMPT_WAIT)
@@ -237,6 +240,7 @@ class Session:
                 data = b""
             if not data:
                 break
+            self._last_output_at = time.monotonic()
             # One critical section per read (PLAN.md §3): scrollback, mirror,
             # parser and the command FSM move together; feed_screen() also
             # markers the clean-text log when a full-screen app exits.
@@ -245,6 +249,15 @@ class Session:
                 alt = st.feed_screen(data)
                 for tok in st.parser.feed(data):
                     self._on_token(tok)
+            if self._needs_hooks is not None:
+                # Answering the probe means typing several KB into the PTY, and
+                # this thread must keep draining while that happens: the shell
+                # echoes every line back, and a full output buffer would stop it
+                # reading, wedging both ends. Hand it to a worker.
+                zsh, self._needs_hooks = self._needs_hooks, None
+                threading.Thread(
+                    target=injection.send_hooks, args=(self, zsh), name=f"quahog-{self.name}-inject", daemon=True
+                ).start()
             self._recorder.output(data)
             if alt is not None:
                 self._emit({"type": "altscreen", "on": alt}, [])
@@ -267,12 +280,6 @@ class Session:
     def _on_token(self, tok: Token) -> None:
         st = self._state
         if tok[0] == "data":
-            if st.dl_active:
-                # Between OSC 2607 Ds and De the command's base64-framed bytes
-                # arrive as ordinary PTY data (PLAN.md §7); divert them from the
-                # console text and the active capture — they are not output.
-                st.dl_parts.append(tok[1].decode("latin-1"))
-                return
             if not st.altscreen:
                 st.ingest(tok[1])
             target = st.active if st.active is not None else st.icap
@@ -300,6 +307,13 @@ class Session:
                     # a history-accurate correction in precmd, before D.
                     st.icap = CommandResult(self.name, st.typed_cmd or "")
                     st.icap._capturing = True
+                    if not self._integrated.is_set():
+                        # Started inside inject()'s clear-to-I window: quahog's
+                        # own plumbing, checked here rather than at close time —
+                        # a live re-inject's single combined snippet line can
+                        # emit its own I (setting _integrated) *before* its own
+                        # D, which would otherwise un-skip it.
+                        st.icap._qs_injecting = True
                     if self._recorder.suppressed:
                         # Typed while input suppression is active (PLAN.md §5):
                         # likely a secret misread as a command — never minuted.
@@ -317,21 +331,14 @@ class Session:
                     st.typed_cmd = None
                     self._ifinish(active)
                     active._finish(rc)
-                    ex = active._exec
-                    if ex is not None:
-                        # Foreground exec: the shell is back at its prompt, so
-                        # the session is free and es.wait() can complete now
-                        # (rc already set by the X tag).
-                        self._clear_fg_exec(ex.eid)
-                        ex._done.set()
                     self._refresh_views()
                 elif st.icap is not None:
                     self._close_icap(rc)
             elif code in ("A", "B"):
                 if code == "A" and st.icap is not None:
-                    # A fresh prompt while a capture is still open: the command
-                    # never produced a D (exec, exit into a nested shell, lost
-                    # integration). Close it out honestly.
+                    # A fresh prompt while a capture is still open: the
+                    # command never produced a D (exec, exit into a nested
+                    # shell, lost integration). Close it out honestly.
                     self._close_icap(None)
                 self._at_prompt.set()
         elif num == "2607":
@@ -349,56 +356,50 @@ class Session:
                 else:
                     st.typed_cmd = cmd
             elif kind == "I":
-                self._on_handshake(rest)
+                self._integrated.set()
+            elif kind == "P":
+                # The probe answered with the shell kind: empty=bash, a zsh
+                # version string=zsh. The reader loop types the matching
+                # snippet once it has dropped st.lock.
+                self._needs_hooks = bool(rest.strip())
             elif kind == "O":
-                # exec output chunk: OSC 2607;QUA;O;<id>;<clean text> (PLAN.md §3).
-                eid, _, text = rest.partition(";")
+                # exec output chunk: OSC 2607;QUA;O;<id>;<fd>;<base64> (PLAN.md
+                # §3). fd is 1 (stdout) or 2 (stderr); the chunk is stored raw.
+                eid, _, fdrest = rest.partition(";")
+                fd, _, b64 = fdrest.partition(";")
                 es = st.execs.get(eid)
                 if es is not None:
-                    es._on_output(text)
+                    try:
+                        data = base64.b64decode(b64)
+                    except (ValueError, TypeError):
+                        log_exception_min()
+                        data = b""
+                    es._on_output(fd, data)
                     if es.mirror:
-                        st.append_external_text(text)
+                        st.append_external_text(data.decode("utf-8", "replace"))
                         self._refresh_views()
             elif kind == "X":
-                # exec completion: OSC 2607;QUA;X;<id>;<rc>. rc lands here; a
-                # foreground exec's _done waits for its shell prompt (D handler).
+                # exec completion: OSC 2607;QUA;X;<id>;<rc>.
                 eid, _, rcs = rest.partition(";")
                 es = st.execs.pop(eid, None)
                 if es is not None:
                     es.returncode = int(rcs) if rcs.lstrip("-").isdigit() else None
-                    if es.background:
-                        es._done.set()
-                        self._clear_fg_exec(eid)
+                    es._done.set()
             elif kind == "U":
                 # upload request (local -> remote): kernel streams the bytes.
-                mode, _, path = rest.partition(";")
-                self._handle_upload(mode, path)
-            elif kind == "Ds":
-                st.dl_active = True
-                st.dl_name = rest
-                st.dl_parts = []
-            elif kind == "De":
-                self._finish_download()
+                self._handle_upload(rest)
         elif num == "7" and payload.startswith("file://"):
             rest = payload[len("file://") :]
             slash = rest.find("/")
             if slash != -1:
                 self.cwd = rest[slash:]
 
-    # ------------------------------------------------------ integration
-    def _on_handshake(self, rest: str) -> None:
-        # OSC 2607;QUA;I;<kind>;<host>;<user> — confirming a successful (re)inject.
-        parts = rest.split(";")
-        if parts and parts[0] in ("bash", "zsh"):
-            self.shell_kind = parts[0]
-        self._integrated.set()
-
     def _record_interactive(self, result: CommandResult, raw_s: slice, text_s: slice) -> None:
         command = result.command.strip()
         if not command:
             return
-        if "__qua_" in command or str(_INJECT_DIR) in command:
-            return  # quahog's own plumbing (reinject, fork helper) isn't minuted
+        if getattr(result, "_qs_injecting", False):
+            return  # plumbing typed during (re)injection: never minuted
         if getattr(result, "_qs_suppressed", False):
             return  # typed while input suppression was active: never minuted
         for note in result.notes:
@@ -704,20 +705,19 @@ class Session:
         return CastWriter(sidecar_dir() / f"{self.name}-fork-{ts}.cast", self._cols, self._rows)
 
     # ---------------------------------------------------------------- exec (§3)
-    def exec(self, command: str, background: bool = False, mirror: bool = False) -> ExecSession:
-        """Run ``command`` on the session's *own* PTY as its own object.
+    def exec(self, command: str, mirror: bool = False) -> ExecSession:
+        """Run ``command`` concurrently with the live shell, over the session's
+        own PTY, demuxed from it by OSC 2607 O/X tags.
 
-        Unlike fork(), exec rides the current PTY, so it works at any navigation
-        depth (local or a remote host you've navigated to) needing only ``socat``
-        and the injected ``__qua_xf`` filter on the far end. Output is captured
-        as escape-stripped clean text, demuxed from the shared stream by OSC
-        2607 O/X tags — which is what lets ``background=True`` interleave safely
-        with the live shell.
-
-        A *foreground* exec (default) owns stdin until it finishes:
-        ``session.send``/``sendline`` raise meanwhile — feed it via
-        ``handle.stdin``. ``mirror=True`` also folds the exec's output into this
-        session's console/streams (default off — isolation is the point).
+        Always launches detached — ``( __qua_exec {eid} {cmd} & )`` — and
+        returns the handle immediately; block on it with ``handle.wait()``
+        when you want to. Output arrives as separate stdout/stderr streams
+        (``es.stdout``/``es.stderr``, raw bytes, no escape-stripping);
+        completion is signalled by the ``X`` tag with the exit code. The
+        far end's ``open3`` closes the command's stdin immediately, so there
+        is no stdin to feed it — wrap the command yourself if it needs one.
+        ``mirror=True`` also folds the output into this session's
+        console/streams (default off — isolation is the point).
         """
         command = command.strip()
         if not command:
@@ -728,65 +728,44 @@ class Session:
             raise RuntimeError(f"session {self.name!r} has exited")
         st = self._state
         eid = f"e{next(self._exec_ids)}"
-        es = ExecSession(self, eid, command, background=background, mirror=mirror)
-        mode = "0" if background else "1"
-        core = f"__qua_exec {eid} {mode} {shlex.quote(command)}"
-        # Background: wrap in a subshell that backgrounds internally — ``( … & )``
-        # is the standard way to launch a job without the interactive shell's
-        # ``[1] <pid>`` monitor-mode notice bleeding into the next command's
-        # captured output. The orphaned job keeps the PTY fd and streams its
-        # OSC 2607 O/X tags from there.
-        line = f"( {core} & )" if background else core
+        es = ExecSession(self, eid, command, mirror=mirror)
+        # ``( … & )`` launches without the interactive shell's ``[1] <pid>``
+        # monitor-mode notice bleeding into the next command's captured
+        # output. The orphaned job keeps the PTY fd and streams its OSC 2607
+        # O/X tags from there.
+        line = f"( __qua_exec {eid} {shlex.quote(command)} & )"
         with st.lock:
-            if st.fg_exec is not None:
-                raise RuntimeError(f"session {self.name!r} is busy with a foreground exec")
-            # Launching either kind means typing a command, so the shell must be
-            # at a prompt — refuse mid run()/interactive command in both cases.
-            # (Once a background job is launched the shell returns to its prompt,
-            # so further commands, including more background execs, are fine.)
+            # Launching means typing a command, so the shell must be at a
+            # prompt — refuse mid run()/interactive command.
             if st.active is not None or st.icap is not None:
                 raise RuntimeError(f"session {self.name!r} is busy")
             st.execs[eid] = es
             self._at_prompt.clear()
-            if not background:
-                # Drive the foreground exec through the command FSM: rc arrives
-                # on the OSC 2607 X tag, but the session is only free again once
-                # the shell returns to its prompt (OSC 133 D). Linking es to the
-                # tracking result lets the D handler complete es.wait() then, so
-                # a back-to-back exec/run doesn't race the finishing prompt.
-                st.fg_exec = eid
-                result = CommandResult(self.name, line)
-                result._exec = es
-                st.active = result
-                st.typed_cmd = None
         self._input(line.encode() + b"\r")
-        if background:
-            # The ``( … & )`` launch subshell exits at once, returning the shell
-            # to its prompt; wait for that so the handle is returned only when
-            # the session is free again (the orphaned job keeps streaming O/X).
-            self._at_prompt.wait(self._PROMPT_WAIT)
-        else:
-            self._emit_stdin_state()  # stdin is the exec's until its prompt returns
+        # The launch subshell exits at once, returning the shell to its
+        # prompt; wait for that so the handle is returned only when the
+        # session is free again (the orphaned job keeps streaming O/X).
+        self._at_prompt.wait(self._PROMPT_WAIT)
         return es
 
     # ------------------------------------------------------------ copy (§7)
     def _copy_base_dir(self) -> Path:
-        """Where ``quahog cat``/``tar`` paths resolve: the notebook's folder,
-        else the kernel cwd."""
+        """Where ``quacat`` paths resolve: the notebook's folder, else the
+        kernel cwd."""
         from .record import notebook_path
 
         nb = notebook_path()
         return nb.parent if nb is not None else Path.cwd()
 
-    def _handle_upload(self, mode: str, path: str) -> None:
-        """A ``quahog cat``/``tar`` request (OSC 2607;QUA;U): resolve the local
-        path and stream a length-framed copy into the PTY, on a worker thread so
-        the (blocking) send never stalls the reader that must keep draining the
+    def _handle_upload(self, path: str) -> None:
+        """A ``quacat`` request (OSC 2607;QUA;U): resolve the local path and
+        stream a length-framed copy into the PTY, on a worker thread so the
+        (blocking) send never stalls the reader that must keep draining the
         helper's acknowledgements."""
 
         def _worker() -> None:
             try:
-                data = _copy.resolve_upload(mode, path, self._copy_base_dir())
+                data = _copy.resolve_upload(path, self._copy_base_dir())
                 frame = _copy.framed_upload(data)
             except OSError:
                 log_exception_min()
@@ -797,52 +776,11 @@ class Session:
 
         threading.Thread(target=_worker, name=f"quahog-upload-{self.name}", daemon=True).start()
 
-    def _finish_download(self) -> None:
-        """End of a ``quahog download`` (OSC 2607;QUA;De): decode the buffered
-        base64, save the file, and surface a download box. Runs the decode/save
-        off the reader thread."""
-        st = self._state
-        name = st.dl_name or "download"
-        b64 = "".join(st.dl_parts)
-        st.dl_active = False
-        st.dl_name = None
-        st.dl_parts = []
-
-        def _worker() -> None:
-            import base64
-
-            try:
-                data = base64.b64decode("".join(b64.split()))
-            except Exception:
-                log_exception_min()
-                return
-            path = _copy.save_download(name, data)
-            box = _copy.DownloadBox(name, data, path)
-            self.downloads.append(box)
-            self._transcript.append(box)
-            self._refresh_notes()
-
-        threading.Thread(target=_worker, name=f"quahog-download-{self.name}", daemon=True).start()
-
     def upload(self, local: str, remote: str) -> CommandResult:
-        """Programmatic ``quahog cat``: copy a local file to ``remote`` on the
-        far side (PLAN.md §7). Typing ``quahog cat`` in the console is the
-        primary interface; this is its twin."""
-        return self.run(f"quahog cat {shlex.quote(local)} > {shlex.quote(remote)}")
-
-    def download(self, remote: str, name: Optional[str] = None) -> "_copy.DownloadBox":
-        """Programmatic ``quahog download``: bring a remote file to the local
-        kernel and return the resulting download box."""
-        name = name or os.path.basename(remote)
-        before = len(self.downloads)
-        self.run(f"cat {shlex.quote(remote)} | quahog download {shlex.quote(name)}")
-        # The De marker triggers an off-thread decode/save; wait for the box.
-        deadline = time.monotonic() + 10
-        while len(self.downloads) == before and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if len(self.downloads) == before:
-            raise RuntimeError(f"download did not complete: {remote!r}")
-        return self.downloads[-1]
+        """Programmatic ``quacat``: copy a local file to ``remote`` on the far
+        side (PLAN.md §7). Typing ``quacat`` in the console is the primary
+        interface; this is its twin."""
+        return self.run(f"quacat {shlex.quote(local)} > {shlex.quote(remote)}")
 
     def _write(self, data: bytes) -> None:
         os.write(self._proc.fd, data)
@@ -936,22 +874,31 @@ class Session:
         """Ctrl-C through the PTY (goes to the foreground process group)."""
         self._input(b"\x03")
 
-    def _check_fg_exec(self) -> None:
-        """A foreground exec owns stdin (PLAN.md §3): steer programmatic input to
-        its handle rather than letting it race the running command."""
-        if self._state.fg_exec is not None:
-            raise RuntimeError(
-                f"session {self.name!r} has a foreground exec running; "
-                "feed it via the exec handle's .stdin/.sendline instead"
-            )
-
     def send(self, data: Union[bytes, str], record: bool = True) -> None:
-        self._check_fg_exec()
         self._input(data if isinstance(data, bytes) else str(data).encode(), record=record)
 
     def sendline(self, line: str = "", record: bool = True) -> None:
-        self._check_fg_exec()
         self._input(line.encode() + b"\r", record=record)
+
+    def type_plumbing(self, command: str) -> None:
+        """Type one of quahog's own commands, which may span lines.
+
+        Kept out of the minutes for free: it runs while ``_integrated`` is
+        still clear (set by ``inject()``, cleared again only by the final ``I``
+        handshake), and ``_record_interactive`` skips everything typed in that
+        window.
+
+        Written in small chunks rather than all at once: an interactive shell
+        echoes back every byte it reads, and pushed several KB faster than it
+        can consume, its input is corrupted outright — measured on macOS bash
+        3.2, a 4KB heredoc sent a line at a time turned into a syntax error 3
+        runs out of 4, while the same content chunked arrived clean 4 out of 4.
+        The pause is flow control, not a guess at how long the shell needs.
+        """
+        data = command.replace("\n", "\r").encode() + b"\r"
+        for i in range(0, len(data), self._PLUMBING_CHUNK):
+            self._input(data[i : i + self._PLUMBING_CHUNK])
+            time.sleep(self._PLUMBING_PAUSE)
 
     def resize(self, rows: int, cols: int) -> None:
         self._rows, self._cols = rows, cols
@@ -1031,27 +978,15 @@ class Session:
             self._emit(content, [])
 
     def _emit_stdin_state(self, widget: Optional["ConsoleView"] = None) -> None:
-        """Tell views whether what they type still reaches the shell: the
-        session has exited (the PTY is gone, keystrokes are dropped), or a
-        foreground exec owns stdin (PLAN.md §3) — typing there feeds the exec,
-        not the shell, since exec rides this same PTY."""
-        if self._exited.is_set():
-            state = "closed"
-        elif self._state.fg_exec is not None:
-            state = "exec"
-        else:
-            state = "open"
+        """Tell views whether what they type still reaches the shell: closed
+        once the session has exited (the PTY is gone, keystrokes are
+        dropped), open otherwise."""
+        state = "closed" if self._exited.is_set() else "open"
         content = {"type": "stdin-state", "state": state}
         if widget is not None:
             self._send_to(widget, content, [])
         else:
             self._emit(content, [])
-
-    def _clear_fg_exec(self, eid: str) -> None:
-        """Release stdin if ``eid`` is the exec holding it, telling the views."""
-        if self._state.fg_exec == eid:
-            self._state.fg_exec = None
-            self._emit_stdin_state()
 
     def close(self) -> None:
         self.terminate()
@@ -1062,9 +997,6 @@ class Session:
 
     def _cleanup(self) -> None:
         self._recorder.close()
-        tmp = getattr(self, "_tmpdir", None)
-        if tmp:
-            shutil.rmtree(tmp, ignore_errors=True)
 
     # -------------------------------------------------------------- widgets
     def _send_to(self, widget: Optional["ConsoleView"], content: Dict[str, Any], buffers: List[bytes]) -> None:
@@ -1219,35 +1151,32 @@ class Session:
         """Whether an integration handshake has been seen at least once."""
         return self._integrated.is_set()
 
-    def reinject(self, full: bool = False) -> None:
-        """Re-type the shell integration after su / exec zsh / a nested shell,
-        or a hand-typed ssh onto a remote host (PLAN.md §7).
+    def inject(self) -> None:
+        """Put the shell integration into wherever the PTY currently sits — a
+        fresh local shell, or a remote host reached by a hand-typed ssh, su, or
+        ``exec zsh`` (PLAN.md §7)."""
+        injection.inject(self)
 
-        ``full=True`` types the whole snippet as plain shell source — needed
-        when the new shell can't read quahog's local file (i.e. anything
-        remote); the default sources the snippet file, which any local shell
-        can do. Fire-and-forget; ``wait_reinject()`` blocks until the snippet's
-        handshake confirms it took.
+    def wait_until_quiet(self, quiet: float = 0.25, cap: float = 5.0) -> None:
+        """Block until the PTY has produced nothing for ``quiet`` seconds.
+
+        A shell that has stopped writing has drawn its prompt and is reading, so
+        this is the point at which typing at it is safe. Both shells discard
+        whatever is already queued when their line editor initialises — measured
+        at 0/5 surviving for zsh and 1/5 for bash when typed immediately after
+        spawn, against 6/6 for both once the output settles — so anything typed
+        before then is simply lost.
         """
-        self._integrated.clear()
-        path = _INJECT_DIR / ("zsh.zsh" if self.shell_kind == "zsh" else "posix.sh")
-        if full:
-            # The snippet contains '![' character classes, which a shell with
-            # history expansion still enabled would mangle at read time — so
-            # disable it first, as its own line. The trailing marker comment
-            # keeps the guard line out of the minutes.
-            if self.shell_kind == "zsh":
-                self.sendline("setopt no_bang_hist # __qua_reinject")
-            else:
-                self.sendline("set +H # __qua_reinject")
-            lines = [ln for ln in path.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-            self.sendline(" ; ".join(lines))
-        else:
-            self.sendline(f". '{path}'")
+        deadline = time.monotonic() + cap
+        while time.monotonic() < deadline:
+            idle = time.monotonic() - self._last_output_at
+            if idle >= quiet:
+                return
+            time.sleep(min(0.02, quiet))
 
-    def wait_reinject(self, timeout: float = 10.0) -> bool:
-        """Block until the integration handshake (OSC 2607;QUA;I) arrives after
-        a reinject — i.e. markers are flowing again — and the shell has reached
+    def wait_integrated(self, timeout: float = 10.0) -> bool:
+        """Block until the integration handshake (OSC 2607;QUA;I) arrives — i.e.
+        markers are flowing again — and the shell has reached
         a clean prompt (so any command left open across the navigation, which
         never emitted its D, is closed out). Returns False on timeout."""
         if not self._integrated.wait(timeout):

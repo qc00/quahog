@@ -24,7 +24,7 @@ function render({ model, el }) {
   title.className = "qua-title";
   title.textContent = model.get("session_name") || "session";
   // What the shell/app calls itself (OSC 0/2 window title), next to the
-  // session name we gave it (PLAN.md §2). No icon (OSC 0/1): there's nothing
+  // session name we gave it (2026-07-22 old plans.md §2). No icon (OSC 0/1): there's nothing
   // here to iconify/minimize, so an icon name has nowhere to show.
   const osc = document.createElement("span");
   osc.className = "qua-osc-title";
@@ -33,7 +33,8 @@ function render({ model, el }) {
   badge.textContent = "full-screen";
   badge.style.display = "none";
   const stdinBadge = document.createElement("span");
-  stdinBadge.className = "qua-badge qua-stdin";
+  stdinBadge.className = "qua-badge qua-stdin-closed";
+  stdinBadge.textContent = "Input disabled";
   stdinBadge.style.display = "none";
   const tools = document.createElement("span");
   tools.className = "qua-tools";
@@ -46,22 +47,8 @@ function render({ model, el }) {
   bar.appendChild(tools);
   bar.appendChild(size);
 
-  // Whether typing here still reaches the shell (kernel-classified, since only
-  // it knows about exit and foreground execs): "closed" -- the session exited,
-  // keystrokes go nowhere; "exec" -- a foreground exec owns stdin, so what you
-  // type feeds the command rather than the shell. Same label either way; the
-  // tooltip (and, for "closed", the tint) is what tells them apart.
   function renderStdin(state) {
-    const shown = state === "closed" || state === "exec";
-    stdinBadge.textContent = "Input disabled";
-    stdinBadge.title =
-      state === "closed"
-        ? "the session has exited; keystrokes are ignored"
-        : state === "exec"
-          ? "a foreground exec owns stdin; typing feeds the command, not the shell"
-          : "";
-    stdinBadge.style.display = shown ? "" : "none";
-    stdinBadge.classList.toggle("qua-badge-off", state === "closed");
+    stdinBadge.style.display = state === "closed" ? "" : "none";
   }
 
   const body = document.createElement("div");
@@ -71,7 +58,7 @@ function render({ model, el }) {
   root.appendChild(body);
   el.appendChild(root);
 
-  // Toolbar (PLAN.md §6): the record toggle and ⌫ erase are always present,
+  // Toolbar (2026-07-22 old plans.md §6): the record toggle and ⌫ erase are always present,
   // each labeled so the icon alone doesn't have to carry the meaning. ⌫
   // flashes when a keystroke goes un-echoed or masked (kernel-classified);
   // the record toggle flashes on Enter — prompts to the user, never actions.
@@ -143,7 +130,7 @@ function render({ model, el }) {
   term.onData((d) => {
     if (exited) return;
     // Enter: flash the record toggle so the user confirms the recording state
-    // (PLAN.md §6).
+    // (2026-07-22 old plans.md §6).
     if (recState.recording && d.includes("\r")) flash(recBtn);
     model.send({ type: "stdin", data: d });
   });
@@ -211,7 +198,7 @@ function render({ model, el }) {
     // first) leaves this listener alive alongside the new one: every future
     // message -- including terminal-query output -- then gets processed
     // twice, independently, by two Terminal instances that each auto-reply
-    // on the app's behalf (the mechanism behind PLAN.md §6's dedup, from a
+    // on the app's behalf (the mechanism behind 2026-07-22 old plans.md §6's dedup, from a
     // different angle than a single view retrying).
     model.off("msg:custom", onCustomMessage);
     model.off("change:session_name", onSessionNameChange);
