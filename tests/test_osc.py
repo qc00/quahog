@@ -39,6 +39,9 @@ def test_csi_stays_data():
 
 
 def test_runaway_osc_passes_through():
-    big = b"\x1b]" + b"x" * 10000
+    # Past _MAX_OSC an unterminated OSC is assumed to be garbage, not a
+    # sequence split across reads, and is passed through as data. exec()'s
+    # base64 chunks stay well under the cap (4KB reads inflate to ~5.5KB).
+    big = b"\x1b]" + b"x" * 250_000
     toks = feed_all([big])
     assert toks == [("data", big)]

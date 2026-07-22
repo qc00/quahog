@@ -8,14 +8,6 @@ from quahog import TimeoutExpired
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
 
 
-@pytest.fixture()
-def sh():
-    s = quahog.bash(inherit_rc=False)
-    yield s
-    s.close()
-    quahog.sessions.pop(s.name, None)
-
-
 def test_echo(sh):
     r = sh.run("echo hello")
     assert r.text.strip() == "hello"
@@ -98,14 +90,10 @@ def test_unicode(sh):
     assert r.text.strip() == "héllo wörld ✓"
 
 
-def test_registry_and_default():
-    s = quahog.bash(inherit_rc=False)
-    try:
-        assert quahog.sessions[s.name] is s
-        assert quahog.default is s
-    finally:
-        s.close()
-        quahog.sessions.pop(s.name, None)
+def test_registry_and_default(sh):
+    s = sh
+    assert quahog.sessions[s.name] is s
+    assert quahog.default is s
 
 
 def test_duplicate_terminal_reply_is_dropped(sh, monkeypatch):
@@ -166,7 +154,7 @@ def test_reinject_after_exec(sh):
     import time
 
     time.sleep(0.8)
-    sh.reinject(full=True)
-    time.sleep(0.8)
+    sh.inject()
+    assert sh.wait_integrated(15)
     r = sh.run("echo back")
     assert r.text.strip() == "back"

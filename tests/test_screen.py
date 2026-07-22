@@ -5,7 +5,6 @@ import time
 
 import pytest
 
-import quahog
 from quahog.screen import ScreenMirror
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
@@ -18,14 +17,6 @@ def _wait(pred, timeout=10.0):
             return True
         time.sleep(0.02)
     return False
-
-
-@pytest.fixture()
-def sh():
-    s = quahog.bash(inherit_rc=False)
-    yield s
-    s.close()
-    quahog.sessions.pop(s.name, None)
 
 
 # ---------------------------------------------------------------- unit level

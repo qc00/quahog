@@ -27,13 +27,11 @@ def _wait(pred, timeout=10.0):
 
 
 @pytest.fixture()
-def rsh(tmp_path, monkeypatch):
-    monkeypatch.delenv("JPY_SESSION_NAME", raising=False)
+def rsh(tmp_path, monkeypatch, shell_env, sh):
+    shell_env["JPY_SESSION_NAME"] = None
     monkeypatch.chdir(tmp_path)
-    s = quahog.bash(inherit_rc=False, record=True)
-    yield s
-    s.close()
-    quahog.sessions.pop(s.name, None)
+    sh.record(True)
+    return sh
 
 
 # ------------------------------------------------------------------ sessions
@@ -139,21 +137,16 @@ def test_pause_and_resume(rsh):
     assert "after-resume" in dump
 
 
-def test_record_starts_lazily(tmp_path, monkeypatch):
+def test_record_starts_lazily(tmp_path, monkeypatch, sh):
     monkeypatch.delenv("JPY_SESSION_NAME", raising=False)
     monkeypatch.chdir(tmp_path)
-    s = quahog.bash(inherit_rc=False)
-    try:
-        assert s.cast_path is None and not s.recording
-        s.record(True)
-        assert s.recording and s.cast_path is not None
-        s.run("echo lazy-start")
-        s.close()
-        _, events = _events(s.cast_path)
-        assert "lazy-start" in json.dumps(events)
-    finally:
-        s.close()
-        quahog.sessions.pop(s.name, None)
+    assert sh.cast_path is None and not sh.recording
+    sh.record(True)
+    assert sh.recording and sh.cast_path is not None
+    sh.run("echo lazy-start")
+    sh.close()
+    _, events = _events(sh.cast_path)
+    assert "lazy-start" in json.dumps(events)
 
 
 def test_fork_gets_own_cast(rsh, tmp_path):

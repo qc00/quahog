@@ -11,7 +11,6 @@ import time
 
 import pytest
 
-import quahog
 from quahog import interceptors
 from quahog.interceptors.builtins import (
     EditorDiffInterceptor,
@@ -30,14 +29,6 @@ def _wait(pred, timeout=10.0):
             return True
         time.sleep(0.02)
     return False
-
-
-@pytest.fixture()
-def sh():
-    s = quahog.bash(inherit_rc=False)
-    yield s
-    s.close()
-    quahog.sessions.pop(s.name, None)
 
 
 # --------------------------------------------------------------- match/hooks
@@ -168,7 +159,7 @@ def test_remote_style_prompt_suppressed(sh, tmp_path, monkeypatch):
     # 'ssh' is matched by PasswordInterceptor.
     # (bash's DEBUG trap never fires for a bare function-definition line, so
     # this needs a trailing no-op to get the run() its C/D markers.)
-    sh.run("ssh() { printf \"user@host's password: \"; read ans; echo got:${#ans}; }; :")
+    sh.run('ssh() { printf "user@host\'s password: "; read ans; echo got:${#ans}; }; :')
     r = sh.run("ssh example", wait=False)
     assert _wait(lambda: "password:" in sh.text.lower())
     time.sleep(0.2)  # let on_output fire and arm suppression

@@ -10,14 +10,6 @@ from quahog import LAST_DUMP, Minute
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
 
 
-@pytest.fixture()
-def sh():
-    s = quahog.bash(inherit_rc=False)
-    yield s
-    s.close()
-    quahog.sessions.pop(s.name, None)
-
-
 def _wait_minutes(s, n=1, timeout=5.0):
     deadline = time.monotonic() + timeout
     while len(s.minutes) < n and time.monotonic() < deadline:
@@ -67,8 +59,8 @@ def test_minuting_toggle(sh):
     assert not sh.minutes
 
 
-def test_reinject_not_minuted(sh):
-    sh.reinject()
+def test_inject_not_minuted(sh):
+    sh.inject()
     time.sleep(0.8)
     assert not sh.minutes
 
@@ -186,7 +178,7 @@ def test_dump_prefix_modes(ip, sh):
 
 
 def test_dump_named_session_prefix(ip, sh):
-    other = quahog.bash(inherit_rc=False)  # becomes quahog.default
+    other = quahog.bash()  # becomes quahog.default
     try:
         _type(sh, "echo mine", 1)
         text = _dumped_text(ip, sh, since=0)
@@ -209,13 +201,8 @@ def test_dump_index_and_datetime_bounds(ip, sh):
     assert _dumped_text(ip, sh, since=0, until=cut) == "%qua echo early"
 
 
-def test_dump_writes_payload_via_ipython(ip):
-    s = quahog.bash(inherit_rc=False)
-    try:
-        s.sendline("echo dump-me")
-        _wait_minutes(s)
-        text = _dumped_text(ip, s)
-        assert text == "%qua echo dump-me"
-    finally:
-        s.close()
-        quahog.sessions.pop(s.name, None)
+def test_dump_writes_payload_via_ipython(ip, sh):
+    sh.sendline("echo dump-me")
+    _wait_minutes(sh)
+    text = _dumped_text(ip, sh)
+    assert text == "%qua echo dump-me"

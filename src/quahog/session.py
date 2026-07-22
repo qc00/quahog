@@ -171,8 +171,8 @@ class Session:
         full_env.update(
             TERM="xterm-256color", QUAHOG="1", QUAHOG_SESSION=name, LANG=full_env.get("LANG", "en_US.UTF-8")
         )
-        if env:
-            full_env.update(env)
+        if env or self._DEFAULT_ENV:
+            full_env.update(env or self._DEFAULT_ENV)
 
         self._proc = PtyProcess.spawn(list(argv), cwd=cwd, env=full_env, dimensions=(rows, cols))
         self._rows, self._cols = rows, cols
@@ -1266,71 +1266,4 @@ class Session:
         state = (
             f"exited {self._returncode}" if self._exited.is_set() else ("busy" if self._state.active else "at prompt")
         )
-        return f"<quahog.Session {self.name} ({self.shell_kind}, pid {self.pid}, {state})>"
-
-
-# ----------------------------------------------------------------- factories
-
-
-def _rcfile_bash(tmpdir: str, inherit_rc: bool) -> str:
-    path = os.path.join(tmpdir, "bashrc")
-    lines: List[str] = []
-    if inherit_rc:
-        lines.append('[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"')
-    else:
-        # Isolated session: keep the in-memory history (minuting needs it) but
-        # never read or write the user's ~/.bash_history.
-        lines.append("HISTFILE=")
-    lines.append(f". '{_INJECT_DIR / 'posix.sh'}'")
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    return path
-
-
-def spawn_bash(
-    name: str,
-    cwd: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None,
-    inherit_rc: bool = True,
-    record: bool = False,
-) -> Session:
-    bash = shutil.which("bash") or "/bin/bash"
-    tmpdir = tempfile.mkdtemp(prefix="quahog-")
-    rcfile = _rcfile_bash(tmpdir, inherit_rc)
-    s = Session(
-        [bash, "--noprofile", "--rcfile", rcfile, "-i"],
-        name=name,
-        shell_kind="bash",
-        cwd=cwd,
-        env=env,
-        record=record,
-    )
-    s._tmpdir = tmpdir
-    return s
-
-
-def spawn_zsh(
-    name: str,
-    cwd: Optional[str] = None,
-    env: Optional[Dict[str, str]] = None,
-    inherit_rc: bool = True,
-    record: bool = False,
-) -> Session:
-    zsh = shutil.which("zsh") or "/bin/zsh"
-    tmpdir = tempfile.mkdtemp(prefix="quahog-")
-    zdot = os.path.join(tmpdir, "zdot")
-    os.makedirs(zdot, exist_ok=True)
-    with open(os.path.join(zdot, ".zshrc"), "w") as f:
-        if inherit_rc:
-            f.write('[ -f "$HOME/.zshrc" ] && ZDOTDIR="$HOME" . "$HOME/.zshrc"\n')
-        f.write(f". '{_INJECT_DIR / 'zsh.zsh'}'\n")
-    s = Session(
-        [zsh, "-i"],
-        name=name,
-        shell_kind="zsh",
-        cwd=cwd,
-        env=dict(env or {}, ZDOTDIR=zdot),
-        record=record,
-    )
-    s._tmpdir = tmpdir
-    return s
+        return f"<quahog.Session {self.name} (pid {self.pid}, {state})>"

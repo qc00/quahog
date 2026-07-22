@@ -1,21 +1,10 @@
 import os
 import sys
-import time
 import types
 
 import pytest
 
-import quahog
-
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="unix PTY only")
-
-
-@pytest.fixture()
-def sh():
-    s = quahog.bash(inherit_rc=False)
-    yield s
-    s.close()
-    quahog.sessions.pop(s.name, None)
 
 
 def test_fork_separates_streams(sh):

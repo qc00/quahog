@@ -1,18 +1,3 @@
-"""Protocol-level verification of minuting against a real ipykernel.
-
-Frontends consume exactly four mechanisms:
-  - update_display_data keeping each displaying cell's primary output (the
-    widget + plain session text/plain, PLAN.md §5) in sync,
-  - update_display_data keeping each displaying cell's second, initially
-    empty/invisible output (interceptor notes, the recording indicator —
-    not literal PTY bytes, PLAN.md §6) in sync,
-  - fresh display_data messages, one per screenshot, each attributed to
-    whichever *one* cell's view was actually clicked/called (PLAN.md §6),
-  - execute_reply payloads with source=set_next_input creating %qua cells.
-These tests assert on those wire messages via jupyter_client — stronger than a
-pixel test, and it is the same surface VS Code consumes.
-"""
-
 import shutil
 import sys
 import time
@@ -103,13 +88,15 @@ def _stdin_states(iopub):
 
 def test_stdin_state_wire_protocol(kernel):
     """The toolbar indicates when typing no longer reaches the shell. The
-    frontend can't work this out for itself — exit and foreground-exec stdin
-    ownership are both kernel-side facts — so it is pushed as its own message
-    on every transition, and answered on a new view's ready handshake."""
+    frontend can't work this out for itself — exit is a kernel-side fact — so
+    it is pushed as its own message on every transition, and answered on a
+    new view's ready handshake. exec() rides pipes on the far end and never
+    borrows stdin, so "open" is the only state short of "closed"."""
     kc = kernel
     execute(
         kc,
-        "import shutil, time\nimport quahog as q\ns = q.bash(inherit_rc=False)\ns._ipython_display_()\n",
+        "import shutil, time, tempfile\nimport quahog as q\n"
+        "s = q.bash(env={'HISTFILE': tempfile.mktemp()})\ns._ipython_display_()\n",
         settle=0.5,
     )
 
@@ -121,13 +108,10 @@ def test_stdin_state_wire_protocol(kernel):
     )
     assert _stdin_states(iopub) == ["open"]
 
-    if shutil.which("socat") and shutil.which("perl"):
-        # A foreground exec borrows stdin: what you type feeds the command.
-        _, iopub = execute(kc, "es = s.exec('read x; echo got:$x')\ntime.sleep(0.3)\n", settle=0.5)
-        assert _stdin_states(iopub) == ["exec"]
-        # ...and hands it back once the shell is at its prompt again.
-        _, iopub = execute(kc, "es.stdin.write('typed\\n')\nes.wait(15)\ntime.sleep(0.3)\n", settle=1.0)
-        assert _stdin_states(iopub)[-1] == "open"
+    if shutil.which("perl"):
+        # exec() runs concurrently and never takes stdin away from the shell.
+        _, iopub = execute(kc, "es = s.exec('echo concurrent')\nes.wait(15)\ntime.sleep(0.3)\n", settle=0.5)
+        assert _stdin_states(iopub) == [] or set(_stdin_states(iopub)) == {"open"}
 
     # Exit closes stdin for good.
     _, iopub = execute(kc, "s.close()\ntime.sleep(0.3)\n", settle=1.0)
@@ -140,7 +124,9 @@ def test_minuting_wire_protocol(kernel):
     # log's text/plain together, under one display_id.
     _, iopub = execute(
         kc,
-        "import quahog as q\n" "h = q.bash(inherit_rc=False)\n" "h._ipython_display_()\n",
+        "import tempfile\nimport quahog as q\n"
+        "h = q.bash(env={'HISTFILE': tempfile.mktemp()})\n"
+        "h._ipython_display_()\n",
         settle=0.5,
     )
     anchors = _live_displays(_displays(iopub))
@@ -218,8 +204,7 @@ def test_screenshot_direct_call_wire_protocol(kernel):
     stray = [
         m
         for m in _displays(iopub)
-        if not m["content"].get("transient", {}).get("display_id")
-        and m["parent_header"].get("msg_id") == other_id
+        if not m["content"].get("transient", {}).get("display_id") and m["parent_header"].get("msg_id") == other_id
     ]
     assert not stray, f"screenshot() leaked into another cell's output: {stray!r}"
 
@@ -267,9 +252,9 @@ def test_screenshot_toolbar_click_wire_protocol(kernel):
     news2 = _new_outputs(iopub)
     assert len(news2) == 1
     assert news2[0]["parent_header"]["msg_id"] == id2
-    assert news2[0]["header"]["msg_id"] != first_click_id, (
-        "two clicks must be two distinct output messages, not the same one repeated"
-    )
+    assert (
+        news2[0]["header"]["msg_id"] != first_click_id
+    ), "two clicks must be two distinct output messages, not the same one repeated"
     # h stays open -- test_concurrent_displays_wire_protocol reuses it.
 
 
